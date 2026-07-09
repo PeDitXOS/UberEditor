@@ -125,7 +125,19 @@ fn frame_service_loop(app: tauri::AppHandle, latest: Arc<Mutex<Vec<u8>>>, runnin
                 .map(|s| s.resolution)
         };
         // vf canónico (tvar="t") solo para COMPARAR: no cambia con el playhead
-        let vf = ue_render::clip_vf(&reg, &r.effects, &r.transform, canvas);
+        let (av_canonical, av_open) = {
+            let store = state.store.lock().unwrap();
+            let seq_id = store.project.active_sequence;
+            (
+                avatar_vf_stream_suffix(&store.project, seq_id, 0, 1.0, PLAYBACK_MAX_W),
+                // tl0 = posición de timeline en este tick (t=0 de la sesión nueva)
+                avatar_vf_stream_suffix(&store.project, seq_id, t, r.speed, PLAYBACK_MAX_W),
+            )
+        };
+        let mut vf = ue_render::clip_vf(&reg, &r.effects, &r.transform, canvas);
+        if let Some(av) = &av_canonical {
+            vf = Some(format!("{}{}", vf.as_deref().unwrap_or("null"), av));
+        }
 
         // ¿sirve la sesión actual? (mismo archivo, misma cadena de efectos,
         // posición alcanzable hacia delante)
@@ -147,7 +159,10 @@ fn frame_service_loop(app: tauri::AppHandle, latest: Arc<Mutex<Vec<u8>>>, runnin
             } else {
                 format!("(t+{rel0:.6})")
             };
-            let open_vf = ue_render::clip_vf_at(&reg, &r.effects, &r.transform, canvas, &tvar);
+            let mut open_vf = ue_render::clip_vf_at(&reg, &r.effects, &r.transform, canvas, &tvar);
+            if let Some(av) = &av_open {
+                open_vf = Some(format!("{}{}", open_vf.as_deref().unwrap_or("null"), av));
+            }
             session =
                 MjpegSession::open(&path, src_t, PLAYBACK_MAX_W, PLAYBACK_FPS, open_vf.as_deref())
                     .ok();
@@ -891,6 +906,107 @@ fn avatar_vf_suffix(
                 ",scale='min({out_w},iw)':-2[main];movie=filename='{escaped}',\
                  scale={aw}:-2[av];[main][av]overlay=W-w-16:H-h-16"
             ));
+        }
+    }
+    None
+}
+
+/// Overlays de avatar para el STREAM de reproducción. A diferencia del export
+/// (un overlay por segmento), agrupa por EMOCIÓN — una sola instancia de
+/// `movie` por video de avatar — y enciende cada una con ventanas `enable`
+/// expresadas en el dominio t de la sesión: t corre en segundos de FUENTE
+/// desde el punto de -ss, así que timeline = tl0 + t/speed ⇒ una ventana
+/// [from,to] de timeline es [(from-tl0)·speed, (to-tl0)·speed] en t.
+/// Con `tl0_us=0, speed=1` produce la forma CANÓNICA (estable entre ticks)
+/// que el FrameService usa para decidir si reabre la sesión.
+pub fn avatar_vf_stream_suffix(
+    project: &Project,
+    seq_id: Id,
+    tl0_us: TimeUs,
+    speed: f64,
+    out_w: u32,
+) -> Option<String> {
+    use std::collections::BTreeMap;
+    use ue_core::model::{ClipPayload, TrackKind};
+    let seq = project.sequence(seq_id)?;
+    for track in seq.tracks.iter().rev().filter(|t| t.kind == TrackKind::Video && !t.muted) {
+        for clip in &track.clips {
+            let ClipPayload::Avatar { driver_asset, avatars, scale, .. } = &clip.payload else {
+                continue;
+            };
+            let default = avatars.keys().next()?.clone();
+            // tramos (emoción, from_tl, to_tl) rellenando huecos con la default
+            let ce = clip.end();
+            let mut spans: Vec<(String, TimeUs, TimeUs)> = vec![];
+            let mut cursor = clip.start;
+            if let Some(doc) = project.transcripts.iter().find(|d| d.asset_id == *driver_asset)
+            {
+                for seg in &doc.segments {
+                    let Some(tl) = asset_tl(project, seq, *driver_asset, seg.start_us) else {
+                        continue;
+                    };
+                    let from = tl.max(clip.start);
+                    let to = (tl + (seg.end_us - seg.start_us)).min(ce);
+                    if to <= from {
+                        continue;
+                    }
+                    if from > cursor {
+                        spans.push((default.clone(), cursor, from));
+                    }
+                    spans.push((seg.emotion.clone().unwrap_or_else(|| default.clone()), from, to));
+                    cursor = to.max(cursor);
+                }
+            }
+            if cursor < ce {
+                spans.push((default.clone(), cursor, ce));
+            }
+            // agrupar ventanas por video de avatar (emociones sin video → default)
+            let mut windows: BTreeMap<String, Vec<(TimeUs, TimeUs)>> = BTreeMap::new();
+            for (emotion, from, to) in spans {
+                let key = if avatars.contains_key(&emotion) { emotion } else { default.clone() };
+                windows.entry(key).or_default().push((from, to));
+            }
+            let aw = (((out_w as f64) * scale.clamp(0.05, 1.0)) as u32) & !1;
+            let mut out = format!(",scale='min({out_w},iw)':-2[avm0]");
+            let mut stage = 0usize;
+            let n_total = windows.len();
+            for (i, (emotion, wins)) in windows.iter().enumerate() {
+                let Some(path) = avatars.get(emotion) else { continue };
+                if !Path::new(path).exists() {
+                    return None;
+                }
+                let escaped =
+                    path.replace('\\', "/").replace(':', "\\\\:").replace('\'', "\\\\'");
+                let enable = wins
+                    .iter()
+                    .map(|(f, t)| {
+                        format!(
+                            "between(t,{:.4},{:.4})",
+                            ((f - tl0_us) as f64 / 1e6 * speed).max(0.0),
+                            ((t - tl0_us) as f64 / 1e6 * speed).max(0.0),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("+");
+                // loop=0 = infinito; setpts monótono para que overlay no se atasque
+                out.push_str(&format!(
+                    ";movie=filename='{escaped}':loop=0,setpts=N/(FRAME_RATE*TB),\
+                     scale={aw}:-2[ave{stage}]"
+                ));
+                let dst = if i + 1 == n_total {
+                    String::new()
+                } else {
+                    format!("[avm{}]", stage + 1)
+                };
+                out.push_str(&format!(
+                    ";[avm{stage}][ave{stage}]overlay=W-w-16:H-h-16:enable='{enable}'{dst}"
+                ));
+                stage += 1;
+            }
+            if stage == 0 {
+                return None;
+            }
+            return Some(out);
         }
     }
     None

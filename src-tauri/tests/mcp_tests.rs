@@ -325,3 +325,244 @@ fn portable_project_roundtrip() {
     assert!(!reopened.assets[0].offline, "existe → online");
     assert!(reopened.assets[1].offline, "no existe → offline");
 }
+
+/// El sufijo de avatar del stream agrupa por emoción y traduce las ventanas
+/// al dominio t de la sesión (timeline = tl0 + t/speed).
+#[test]
+fn avatar_stream_suffix_groups_by_emotion_and_maps_time() {
+    use ue_core::model::*;
+    use ue_core::ops::InsertMode;
+
+    // dos "videos" de avatar en disco (basta con que existan)
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("ue-avatar-stream");
+    std::fs::create_dir_all(&dir).unwrap();
+    let calm = dir.join("calm.mp4");
+    let angry = dir.join("angry.mp4");
+    std::fs::write(&calm, b"x").unwrap();
+    std::fs::write(&angry, b"x").unwrap();
+
+    let mut project = Project::new("avatar-stream");
+    let seq_id = project.active_sequence;
+    // asset conductor ficticio + clip media que lo pone en el timeline 0..10s
+    let asset = MediaAsset {
+        id: Id::new(),
+        kind: MediaKind::Video,
+        path: "/no/importa.mp4".into(),
+        content_hash: "h".into(),
+        probe: ProbeInfo {
+            duration_us: 10_000_000,
+            fps: Some((30, 1)),
+            width: 1920,
+            height: 1080,
+            rotation: 0,
+            vcodec: None,
+            acodec: None,
+            audio_channels: 0,
+            vfr: false,
+        },
+        proxy: None,
+        audio_conform: None,
+        peaks: None,
+        thumbnails: None,
+        transcript: None,
+        offline: false,
+    };
+    let aid = asset.id;
+    project.assets.push(asset);
+    let doc_id = Id::new();
+    project.transcripts.push(TranscriptDoc {
+        id: doc_id,
+        asset_id: aid,
+        language: "es".into(),
+        model: "t".into(),
+        words: vec![],
+        segments: vec![
+            Segment {
+                text: "tranquilo".into(),
+                start_us: 1_000_000,
+                end_us: 3_000_000,
+                word_range: (0, 0),
+                emotion: Some("calm".into()),
+                volume_rms: 0.0,
+            },
+            Segment {
+                text: "furioso".into(),
+                start_us: 3_000_000,
+                end_us: 5_000_000,
+                word_range: (0, 0),
+                emotion: Some("angry".into()),
+                volume_rms: 0.0,
+            },
+        ],
+        global_avg_volume: 0.0,
+    });
+    let v1 = project
+        .sequence(seq_id)
+        .unwrap()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Video)
+        .unwrap()
+        .id;
+    let mut store = ue_core::ProjectStore::new(project);
+    store
+        .insert_clip(v1, Clip::new_media(aid, 0, 10_000_000, 0), InsertMode::Strict)
+        .unwrap();
+    let mut avatars = std::collections::BTreeMap::new();
+    avatars.insert("calm".to_string(), calm.to_string_lossy().into_owned());
+    avatars.insert("angry".to_string(), angry.to_string_lossy().into_owned());
+    let av_clip = Clip {
+        id: Id::new(),
+        payload: ClipPayload::Avatar {
+            driver_asset: aid,
+            avatars,
+            shake_factor: 0.0,
+            scale: 0.25,
+        },
+        start: 0,
+        duration: 10_000_000,
+        speed: 1.0,
+        effects: vec![],
+        transform: Default::default(),
+        audio: AudioProps { muted: true, ..Default::default() },
+        transition_in: None,
+        label_color: None,
+        group: None,
+    };
+    let track2 = Track::new(TrackKind::Video, "V2");
+    let v2 = track2.id;
+    let seq_len = store.project.sequence(seq_id).unwrap().tracks.len();
+    store
+        .dispatch(
+            "V2",
+            vec![ue_core::Action::AddTrack { sequence_id: seq_id, index: seq_len, track: track2 }],
+        )
+        .unwrap();
+    store.insert_clip(v2, av_clip, InsertMode::Strict).unwrap();
+
+    // forma canónica (tl0=0, speed=1): ventanas absolutas de timeline
+    let canonical =
+        ue_tauri_lib::avatar_vf_stream_suffix(&store.project, seq_id, 0, 1.0, 960).unwrap();
+    // una sola instancia de movie por emoción (2), no por segmento
+    assert_eq!(canonical.matches("movie=").count(), 2, "{canonical}");
+    assert!(canonical.contains("between(t,1.0000,3.0000)"), "{canonical}");
+    assert!(canonical.contains("between(t,3.0000,5.0000)"), "{canonical}");
+    // la emoción default (calm, primera) rellena los huecos 0-1 y 5-10
+    assert!(canonical.contains("between(t,0.0000,1.0000)"), "{canonical}");
+    assert!(canonical.contains("between(t,5.0000,10.0000)"), "{canonical}");
+
+    // sesión abierta en tl0=2s a velocidad 2×: ventana [3,5] → [2,6] en t
+    let open =
+        ue_tauri_lib::avatar_vf_stream_suffix(&store.project, seq_id, 2_000_000, 2.0, 960).unwrap();
+    assert!(open.contains("between(t,2.0000,6.0000)"), "{open}");
+    // la ventana [1,3] queda [0,2] (el pasado se clampa a 0)
+    assert!(open.contains("between(t,0.0000,2.0000)"), "{open}");
+}
+
+/// El grafo del avatar de reproducción corre en ffmpeg real: el avatar rojo
+/// aparece en la esquina inferior derecha del stream.
+#[test]
+fn avatar_stream_graph_runs_in_ffmpeg() {
+    use std::process::Command;
+    use ue_core::model::*;
+    use ue_core::ops::InsertMode;
+
+    let ffmpeg = ue_media::ffmpeg_bin();
+    if Command::new(&ffmpeg).arg("-version").output().map(|o| !o.status.success()).unwrap_or(true)
+    {
+        eprintln!("AVISO: sin ffmpeg; test saltado");
+        return;
+    }
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("ue-avatar-e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("base_black.mp4");
+    let avatar = dir.join("avatar_red.mp4");
+    for (path, src) in [
+        (&base, "color=black:s=640x360:r=30:d=4"),
+        (&avatar, "color=red:s=160x90:r=30:d=1"),
+    ] {
+        if !path.exists() {
+            let st = Command::new(&ffmpeg)
+                .args(["-y", "-v", "error", "-f", "lavfi", "-i", src])
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+    }
+
+    let mut project = Project::new("avatar-e2e");
+    let seq_id = project.active_sequence;
+    let asset = ue_media::import_file(&base).unwrap();
+    let aid = asset.id;
+    project.assets.push(asset);
+    let v1 = project
+        .sequence(seq_id)
+        .unwrap()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Video)
+        .unwrap()
+        .id;
+    let mut store = ue_core::ProjectStore::new(project);
+    store.insert_clip(v1, Clip::new_media(aid, 0, 4 * SEC, 0), InsertMode::Strict).unwrap();
+    let mut avatars = std::collections::BTreeMap::new();
+    avatars.insert("calm".to_string(), avatar.to_string_lossy().into_owned());
+    let track2 = Track::new(TrackKind::Video, "V2");
+    let v2 = track2.id;
+    let n = store.project.sequence(seq_id).unwrap().tracks.len();
+    store
+        .dispatch(
+            "V2",
+            vec![ue_core::Action::AddTrack { sequence_id: seq_id, index: n, track: track2 }],
+        )
+        .unwrap();
+    store
+        .insert_clip(
+            v2,
+            Clip {
+                id: Id::new(),
+                payload: ClipPayload::Avatar {
+                    driver_asset: aid,
+                    avatars,
+                    shake_factor: 0.0,
+                    scale: 0.25,
+                },
+                start: 0,
+                duration: 4 * SEC,
+                speed: 1.0,
+                effects: vec![],
+                transform: Default::default(),
+                audio: AudioProps { muted: true, ..Default::default() },
+                transition_in: None,
+                label_color: None,
+                group: None,
+            },
+            InsertMode::Strict,
+        )
+        .unwrap();
+
+    let suffix =
+        ue_tauri_lib::avatar_vf_stream_suffix(&store.project, seq_id, 0, 1.0, 640).unwrap();
+    let vf = format!("null{suffix}");
+    // mismo -vf que usa la MjpegSession: un frame a t=1s y verificar la esquina
+    let png = dir.join("frame.png");
+    let out = Command::new(&ffmpeg)
+        .args(["-y", "-v", "error", "-ss", "1", "-i"])
+        .arg(&base)
+        .args(["-vf", &vf, "-frames:v", "1"])
+        .arg(&png)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "grafo inválido: {}", String::from_utf8_lossy(&out.stderr));
+    // píxel en la esquina inferior derecha (donde va el avatar 160x90 @16px)
+    let probe = Command::new(&ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(&png)
+        .args(["-vf", "crop=1:1:600:320", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .output()
+        .unwrap();
+    let px = &probe.stdout;
+    assert!(px.len() >= 3 && px[0] > 180 && px[1] < 80, "avatar rojo en la esquina: {px:?}");
+}
