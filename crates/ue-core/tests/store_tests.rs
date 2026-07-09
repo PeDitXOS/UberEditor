@@ -434,3 +434,61 @@ mod property_tests {
         }
     }
 }
+
+#[test]
+fn move_range_reorders_and_preserves_material() {
+    let (mut store, seq, vtrack, atrack, va, aa) = fixture();
+    // V1: un clip de 9 s [0..9); A1: audio paralelo [0..9)
+    store.insert_clip(vtrack, Clip::new_media(va, 0, 9 * SEC, 0), InsertMode::Strict).unwrap();
+    store.insert_clip(atrack, Clip::new_media(aa, 0, 9 * SEC, 0), InsertMode::Strict).unwrap();
+    let snapshot = store.project.clone();
+
+    // mover el tercio central [3..6) al principio (dest=0)
+    store.move_range(seq, 3 * SEC, 6 * SEC, 0).unwrap();
+
+    for track_id in [vtrack, atrack] {
+        let track = store.project.track(track_id).unwrap();
+        // material total conservado y contiguo
+        let total: i64 = track.clips.iter().map(|c| c.duration).sum();
+        assert_eq!(total, 9 * SEC);
+        let mut expected = 0;
+        for c in &track.clips {
+            assert_eq!(c.start, expected, "sin huecos tras mover");
+            expected = c.end();
+        }
+        // el primer clip ahora es el material fuente [3..6)
+        let first = &track.clips[0];
+        match &first.payload {
+            ClipPayload::Media { src_in, src_out, .. } => {
+                assert_eq!((*src_in, *src_out), (3 * SEC, 6 * SEC), "el tercio central va primero");
+            }
+            _ => panic!("payload inesperado"),
+        }
+    }
+    assert!(validate(&store.project).is_empty());
+
+    // una sola entrada de undo lo revierte todo
+    store.undo().unwrap();
+    assert_eq!(store.project, snapshot);
+}
+
+#[test]
+fn move_range_forward_and_edge_cases() {
+    let (mut store, seq, vtrack, _at, va, _aa) = fixture();
+    store.insert_clip(vtrack, Clip::new_media(va, 0, 9 * SEC, 0), InsertMode::Strict).unwrap();
+
+    // mover [0..3) al final (dest=9): queda [3..9)+[0..3)
+    store.move_range(seq, 0, 3 * SEC, 9 * SEC).unwrap();
+    let track = store.project.track(vtrack).unwrap();
+    let last = track.clips.last().unwrap();
+    match &last.payload {
+        ClipPayload::Media { src_in, .. } => assert_eq!(*src_in, 0, "el inicio quedó al final"),
+        _ => panic!(),
+    }
+    assert_eq!(track.clips.last().unwrap().end(), 9 * SEC, "duración total intacta");
+
+    // destino dentro del rango → error y sin cambios
+    let before = store.project.clone();
+    assert!(store.move_range(seq, 0, 4 * SEC, 2 * SEC).is_err());
+    assert_eq!(store.project, before);
+}

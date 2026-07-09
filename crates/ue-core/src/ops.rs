@@ -429,6 +429,136 @@ fn media_src(c: &Clip) -> (Option<TimeUs>, Option<TimeUs>) {
     }
 }
 
+/// Divide en `t` cualquier clip que lo cruce, en todas las pistas dadas.
+fn split_all_at(plan: &mut Planner, track_ids: &[Id], t: TimeUs) -> UeResult<()> {
+    for tid in track_ids {
+        let victim = plan
+            .proj
+            .track(*tid)
+            .and_then(|tr| {
+                tr.clips
+                    .iter()
+                    .find(|c| c.start < t && t < c.end())
+                    .cloned()
+            });
+        if let Some(c) = victim {
+            let (left, right) = split_clip_data(&c, t - c.start);
+            plan.do_(Action::ReplaceClips {
+                track_id: *tid,
+                remove_ids: vec![c.id],
+                insert: vec![left, right],
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Mueve el rango [from, to) de la secuencia a `dest` (fuera del rango),
+/// en todas las pistas no bloqueadas. Corta en las fronteras, cierra el hueco
+/// de origen, abre hueco en destino y recoloca. Base de "mover frases" en la
+/// edición por texto. Una transacción.
+pub fn move_range(
+    project: &Project,
+    sequence_id: Id,
+    from: TimeUs,
+    to: TimeUs,
+    dest: TimeUs,
+) -> UeResult<Vec<Action>> {
+    let seq = project
+        .sequence(sequence_id)
+        .ok_or_else(|| UeError::NotFound(format!("secuencia {sequence_id}")))?;
+    let from = quantize_to_frame(from.max(0), seq.fps);
+    let to = quantize_to_frame(to, seq.fps);
+    let dest = quantize_to_frame(dest.max(0), seq.fps);
+    if to <= from {
+        return Err(UeError::Invalid("rango vacío".into()));
+    }
+    if dest > from && dest < to {
+        return Err(UeError::Invalid("el destino no puede caer dentro del rango".into()));
+    }
+    let len = to - from;
+    let track_ids: Vec<Id> = seq.tracks.iter().filter(|t| !t.locked).map(|t| t.id).collect();
+
+    let mut plan = Planner::new(project);
+    // 1. fronteras exactas
+    split_all_at(&mut plan, &track_ids, from)?;
+    split_all_at(&mut plan, &track_ids, to)?;
+    split_all_at(&mut plan, &track_ids, dest)?;
+
+    // 2. extraer los clips del rango (clones) y quitarlos
+    let mut moved: Vec<(Id, Clip)> = vec![]; // (track, clip)
+    for tid in &track_ids {
+        let inside: Vec<Clip> = plan
+            .proj
+            .track(*tid)
+            .unwrap()
+            .clips
+            .iter()
+            .filter(|c| c.start >= from && c.end() <= to)
+            .cloned()
+            .collect();
+        for c in inside {
+            plan.do_(Action::RemoveClip { clip_id: c.id })?;
+            moved.push((*tid, c));
+        }
+    }
+
+    // 3. cerrar el hueco de origen (izquierda, ascendente)
+    for tid in &track_ids {
+        let after: Vec<(Id, TimeUs, TimeUs)> = plan
+            .proj
+            .track(*tid)
+            .unwrap()
+            .clips
+            .iter()
+            .filter(|c| c.start >= to)
+            .map(|c| (c.id, c.start, c.duration))
+            .collect();
+        for (cid, start, duration) in after {
+            plan.do_(Action::SetClipBounds {
+                clip_id: cid,
+                start: start - len,
+                duration,
+                src_in: None,
+                src_out: None,
+            })?;
+        }
+    }
+
+    // 4. destino ajustado tras cerrar el hueco
+    let dest_adj = if dest >= to { dest - len } else { dest };
+
+    // 5. abrir hueco en destino (derecha, DESCENDENTE para no colisionar)
+    for tid in &track_ids {
+        let mut after: Vec<(Id, TimeUs, TimeUs)> = plan
+            .proj
+            .track(*tid)
+            .unwrap()
+            .clips
+            .iter()
+            .filter(|c| c.start >= dest_adj)
+            .map(|c| (c.id, c.start, c.duration))
+            .collect();
+        after.sort_by_key(|(_, start, _)| std::cmp::Reverse(*start));
+        for (cid, start, duration) in after {
+            plan.do_(Action::SetClipBounds {
+                clip_id: cid,
+                start: start + len,
+                duration,
+                src_in: None,
+                src_out: None,
+            })?;
+        }
+    }
+
+    // 6. recolocar los clips extraídos
+    for (tid, mut clip) in moved {
+        clip.start = dest_adj + (clip.start - from);
+        plan.do_(Action::InsertClip { track_id: tid, clip })?;
+    }
+    Ok(plan.finish())
+}
+
 /// Elimina rangos de tiempo de TODA la secuencia (todas las pistas no bloqueadas),
 /// con ripple opcional. Base de "eliminar silencios" y edición por texto.
 pub fn cut_ranges(

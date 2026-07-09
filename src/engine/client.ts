@@ -84,6 +84,14 @@ export interface EngineClient {
     value: boolean,
   ): Promise<StateSnapshot>;
 
+  /** Mueve un rango del timeline a otro punto (reordenar material). */
+  moveRange(
+    sequenceId: Id,
+    fromUs: TimeUs,
+    toUs: TimeUs,
+    destUs: TimeUs,
+  ): Promise<StateSnapshot>;
+
   /** Corta rangos del timeline en todas las pistas (ripple opcional). */
   cutRanges(
     sequenceId: Id,

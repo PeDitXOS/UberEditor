@@ -283,6 +283,22 @@ fn cut_ranges(
     Ok(snapshot(&store))
 }
 
+/// Mueve un rango del timeline a otro punto (todas las pistas, 1 undo).
+#[tauri::command]
+fn move_range(
+    state: State<AppState>,
+    sequence_id: String,
+    from_us: TimeUs,
+    to_us: TimeUs,
+    dest_us: TimeUs,
+) -> Res<StateSnapshot> {
+    let mut store = state.store.lock().unwrap();
+    store
+        .move_range(parse_id(&sequence_id)?, from_us, to_us, dest_us)
+        .map_err(|e| e.to_string())?;
+    Ok(snapshot(&store))
+}
+
 #[tauri::command]
 fn undo(state: State<AppState>) -> Res<StateSnapshot> {
     let mut store = state.store.lock().unwrap();
@@ -481,6 +497,74 @@ fn add_clip(state: State<AppState>, asset_id: String, at_us: TimeUs) -> Res<Stat
     Ok(snapshot(&store))
 }
 
+/// Overlay del avatar activo en `t` para el frame pausado: sufijo -vf con
+/// movie+overlay (estático, sin shake: es un frame quieto).
+fn avatar_vf_suffix(
+    project: &Project,
+    seq_id: Id,
+    t_us: TimeUs,
+    out_w: u32,
+) -> Option<String> {
+    use ue_core::model::{ClipPayload, TrackKind};
+    let seq = project.sequence(seq_id)?;
+    for track in seq.tracks.iter().rev().filter(|t| t.kind == TrackKind::Video && !t.muted) {
+        for clip in &track.clips {
+            let ClipPayload::Avatar { driver_asset, avatars, scale, .. } = &clip.payload else {
+                continue;
+            };
+            if !(clip.start <= t_us && t_us < clip.end()) {
+                continue;
+            }
+            let default = avatars.keys().next()?.clone();
+            // emoción del segmento activo (o default)
+            let emotion = project
+                .transcripts
+                .iter()
+                .find(|d| d.asset_id == *driver_asset)
+                .and_then(|doc| {
+                    doc.segments.iter().find_map(|seg| {
+                        let tl = crate::asset_tl(project, seq, *driver_asset, seg.start_us)?;
+                        let end = tl + (seg.end_us - seg.start_us);
+                        (tl <= t_us && t_us < end).then(|| seg.emotion.clone()).flatten()
+                    })
+                })
+                .unwrap_or(default.clone());
+            let path = avatars.get(&emotion).or_else(|| avatars.get(&default))?;
+            if !Path::new(path).exists() {
+                return None;
+            }
+            let aw = (((out_w as f64) * scale.clamp(0.05, 1.0)) as u32) & !1;
+            let escaped = path.replace('\\', "/").replace(':', "\\\\:").replace('\'', "\\\\'");
+            // escalar el main ANTES del overlay para que aw sea proporcional
+            return Some(format!(
+                ",scale='min({out_w},iw)':-2[main];movie=filename='{escaped}',\
+                 scale={aw}:-2[av];[main][av]overlay=W-w-16:H-h-16"
+            ));
+        }
+    }
+    None
+}
+
+/// Tiempo de asset → timeline (helper compartido con avatar_vf_suffix).
+pub(crate) fn asset_tl(
+    _project: &Project,
+    seq: &ue_core::model::Sequence,
+    asset_id: Id,
+    t_asset: TimeUs,
+) -> Option<TimeUs> {
+    use ue_core::model::ClipPayload;
+    for track in &seq.tracks {
+        for clip in &track.clips {
+            if let ClipPayload::Media { asset_id: aid, src_in, src_out } = &clip.payload {
+                if *aid == asset_id && t_asset >= *src_in && t_asset < *src_out {
+                    return Some(clip.start + (t_asset - src_in));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Frame real JPEG del tiempo dado (bytes crudos; vacío = sin señal).
 #[tauri::command]
 fn render_frame(
@@ -500,8 +584,12 @@ fn render_frame(
         (store.project.clone(), store.project.active_sequence, base)
     }; // soltar el lock antes de invocar ffmpeg
     let reg = state.registry.lock().unwrap().clone();
-    let vf = ue_media::frame::resolve_top_video(&project, seq_id, t_us)
+    let mut vf = ue_media::frame::resolve_top_video(&project, seq_id, t_us)
         .and_then(|r| ue_render::clip_vf(&reg, &r.effects, &r.transform));
+    // avatar sobre el frame pausado (grafo movie+overlay en el mismo -vf)
+    if let Some(suffix) = avatar_vf_suffix(&project, seq_id, t_us, max_width) {
+        vf = Some(format!("{}{}", vf.unwrap_or_else(|| "null".into()), suffix));
+    }
     let bytes =
         ue_media::frame::render_frame(&project, seq_id, t_us, max_width, &base_dir, vf.as_deref())
             .map_err(|e| e.to_string())?
@@ -1058,6 +1146,7 @@ pub fn run() {
             move_clip,
             trim_clip,
             cut_ranges,
+            move_range,
             undo,
             redo,
             set_clip_audio,

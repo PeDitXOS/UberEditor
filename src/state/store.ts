@@ -68,6 +68,7 @@ export interface UiState {
   addAvatarClip: (clipId: Id) => Promise<void>;
   setActiveSequence: (sequenceId: Id) => Promise<void>;
   cutTimelineRanges: (ranges: [TimeUs, TimeUs][]) => Promise<void>;
+  moveTimelineRange: (fromUs: TimeUs, toUs: TimeUs, destUs: TimeUs) => Promise<void>;
   setClipText: (clipId: Id, content: string, style: TextStyle) => Promise<void>;
   toggleTrack: (trackId: Id, prop: "muted" | "solo" | "locked") => Promise<void>;
   undo: () => Promise<void>;
@@ -287,6 +288,13 @@ export const useStore = create<UiState>((set, get) => {
       run("Editar efectos", () => engine.setClipEffects(clipId, effects)),
     setClipTransition: (clipId, transition) =>
       run("Editar transición", () => engine.setClipTransition(clipId, transition)),
+
+    moveTimelineRange: async (fromUs, toUs, destUs) => {
+      const seqId = activeSequence(get().project).id;
+      await run("Mover rango por texto", () =>
+        engine.moveRange(seqId, fromUs, toUs, destUs),
+      );
+    },
 
     cutTimelineRanges: async (ranges) => {
       if (!ranges.length) return;

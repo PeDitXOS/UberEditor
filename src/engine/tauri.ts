@@ -170,6 +170,15 @@ export class TauriEngine implements EngineClient {
     return invoke("set_track_prop", { trackId, prop, value });
   }
 
+  moveRange(
+    sequenceId: Id,
+    fromUs: TimeUs,
+    toUs: TimeUs,
+    destUs: TimeUs,
+  ): Promise<StateSnapshot> {
+    return invoke("move_range", { sequenceId, fromUs, toUs, destUs });
+  }
+
   cutRanges(
     sequenceId: Id,
     ranges: [TimeUs, TimeUs][],

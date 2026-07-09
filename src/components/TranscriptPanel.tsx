@@ -13,6 +13,7 @@ export function TranscriptPanel() {
   const project = useStore((s) => s.project);
   const seek = useStore((s) => s.seek);
   const cutTimelineRanges = useStore((s) => s.cutTimelineRanges);
+  const moveTimelineRange = useStore((s) => s.moveTimelineRange);
   const playheadUs = useStore((s) => s.playheadUs);
   const [assetSel, setAssetSel] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -50,6 +51,20 @@ export function TranscriptPanel() {
     const words = [...selected].sort((a, b) => a - b).map((i) => doc.words[i]);
     const ranges = wordsToCutRanges(project, doc.asset_id, words);
     await cutTimelineRanges(ranges);
+    setSelected(new Set());
+  };
+
+  const moveSelectedToPlayhead = async () => {
+    const words = [...selected].sort((a, b) => a - b).map((i) => doc.words[i]);
+    // sin padding: mover exactamente el material de las palabras
+    const ranges = wordsToCutRanges(project, doc.asset_id, words, 0, 150_000);
+    if (ranges.length !== 1) {
+      useStore.setState({
+        lastActionLabel: "⚠ para mover, selecciona palabras contiguas (un solo bloque)",
+      });
+      return;
+    }
+    await moveTimelineRange(ranges[0][0], ranges[0][1], playheadUs);
     setSelected(new Set());
   };
 
@@ -111,7 +126,15 @@ export function TranscriptPanel() {
             ✂ Cortar {selected.size > 0 ? `${selected.size} palabra(s)` : "selección"}
           </button>
           <button
-            className="focus-ring rounded-md border border-line px-2 py-1.5 text-[12px] text-ink-dim hover:text-ink disabled:opacity-40"
+            className="focus-ring rounded-md border border-line px-2 py-1.5 text-[12px] text-ink-dim enabled:hover:text-ink disabled:opacity-40"
+            disabled={selected.size === 0}
+            onClick={() => void moveSelectedToPlayhead()}
+            title="Mueve las palabras marcadas (contiguas) al playhead"
+          >
+            ⇢ Mover
+          </button>
+          <button
+            className="focus-ring rounded-md border border-line px-2 py-1.5 text-[12px] text-ink-dim enabled:hover:text-ink disabled:opacity-40"
             disabled={selected.size === 0}
             onClick={() => setSelected(new Set())}
           >

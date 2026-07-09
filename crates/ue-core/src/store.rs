@@ -128,6 +128,17 @@ impl ProjectStore {
         self.dispatch("Recortar clip", actions)
     }
 
+    pub fn move_range(
+        &mut self,
+        sequence_id: Id,
+        from: TimeUs,
+        to: TimeUs,
+        dest: TimeUs,
+    ) -> UeResult<()> {
+        let actions = ops::move_range(&self.project, sequence_id, from, to, dest)?;
+        self.dispatch("Mover rango", actions)
+    }
+
     pub fn cut_ranges(
         &mut self,
         sequence_id: Id,

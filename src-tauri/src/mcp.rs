@@ -111,6 +111,19 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "move_range",
+            "description": "Mueve el rango [from_us, to_us) del timeline a dest_us (reordena material en todas las pistas; 1 undo). Útil para reordenar frases.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_us": { "type": "integer" },
+                    "to_us": { "type": "integer" },
+                    "dest_us": { "type": "integer" }
+                },
+                "required": ["from_us", "to_us", "dest_us"]
+            }
+        },
+        {
             "name": "generate_vertical",
             "description": "Genera una secuencia vertical 1080x1920 (fondo desenfocado + video centrado) a partir de la secuencia activa y la activa. Deshacible.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
@@ -266,6 +279,19 @@ fn call_tool(state: &AppState, name: &str, args: &Value) -> Value {
             match remove_silences_inner(state, clip_id) {
                 Ok((n, us)) => text_result(json!({ "removed": n, "removed_us": us })),
                 Err(e) => tool_error(&e),
+            }
+        }
+        "move_range" => {
+            let get = |k: &str| args.get(k).and_then(|v| v.as_i64());
+            let (Some(f), Some(t), Some(d)) = (get("from_us"), get("to_us"), get("dest_us"))
+            else {
+                return tool_error("faltan from_us/to_us/dest_us");
+            };
+            let mut store = state.store.lock().unwrap();
+            let seq_id = store.project.active_sequence;
+            match store.move_range(seq_id, f, t, d) {
+                Ok(()) => text_result(json!({ "ok": true })),
+                Err(e) => tool_error(&e.to_string()),
             }
         }
         "generate_vertical" => match generate_vertical_inner(state) {

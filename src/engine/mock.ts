@@ -329,6 +329,10 @@ export class MockEngine implements EngineClient {
     });
   }
 
+  async moveRange(): Promise<StateSnapshot> {
+    throw new Error("Mover texto requiere la app de escritorio (npx tauri dev)");
+  }
+
   async cutRanges(): Promise<StateSnapshot> {
     throw new Error("La edición por texto requiere la app de escritorio (npx tauri dev)");
   }
