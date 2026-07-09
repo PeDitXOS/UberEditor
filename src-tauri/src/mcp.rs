@@ -276,7 +276,8 @@ fn call_tool(state: &AppState, name: &str, args: &Value) -> Value {
                 Ok(v) => v,
                 Err(e) => return tool_error(&e),
             };
-            match remove_silences_inner(state, clip_id) {
+            let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("delete").to_string();
+            match remove_silences_inner(state, clip_id, &mode) {
                 Ok((n, us)) => text_result(json!({ "removed": n, "removed_us": us })),
                 Err(e) => tool_error(&e),
             }
@@ -321,7 +322,7 @@ fn generate_vertical_inner(state: &AppState) -> Result<String, String> {
     crate::generate_vertical_impl(state)
 }
 
-fn remove_silences_inner(state: &AppState, clip_id: ue_core::model::Id) -> Result<(usize, i64), String> {
+fn remove_silences_inner(state: &AppState, clip_id: ue_core::model::Id, mode: &str) -> Result<(usize, i64), String> {
     let mut store = state.store.lock().unwrap();
     let clip = store.project.clip(clip_id).ok_or("clip no encontrado")?.clone();
     let ue_core::model::ClipPayload::Media { asset_id, src_in, src_out } = clip.payload else {
@@ -339,7 +340,11 @@ fn remove_silences_inner(state: &AppState, clip_id: ue_core::model::Id) -> Resul
     }
     let removed_us: i64 = ranges.iter().map(|(s, e)| e - s).sum();
     let seq_id = store.project.active_sequence;
-    store.cut_ranges(seq_id, &ranges, true).map_err(|e| e.to_string())?;
+    if mode == "speedup" {
+        store.speedup_ranges(seq_id, &ranges, 4.0).map_err(|e| e.to_string())?;
+    } else {
+        store.cut_ranges(seq_id, &ranges, true).map_err(|e| e.to_string())?;
+    }
     Ok((ranges.len(), removed_us))
 }
 

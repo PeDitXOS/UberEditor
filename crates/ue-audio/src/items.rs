@@ -15,7 +15,9 @@ pub struct ItemSpec {
     pub asset_id: Id,
     pub timeline_start_us: i64,
     pub src_in_us: i64,
+    /// Duración en TIEMPO DE TIMELINE (la fuente ya dividida por speed).
     pub len_us: i64,
+    pub speed: f64,
     pub gain_db: f64,
     pub fade_in_us: i64,
     pub fade_out_us: i64,
@@ -41,11 +43,13 @@ pub fn collect_specs(project: &Project, sequence_id: Id) -> Vec<ItemSpec> {
             if asset.probe.audio_channels == 0 {
                 continue;
             }
+            let src_len_tl = (((*src_out - *src_in) as f64) / clip.speed).round() as i64;
             specs.push(ItemSpec {
                 asset_id: *asset_id,
                 timeline_start_us: clip.start,
                 src_in_us: *src_in,
-                len_us: (*src_out - *src_in).min(clip.duration),
+                len_us: src_len_tl.min(clip.duration),
+                speed: clip.speed,
                 gain_db: clip.audio.gain_db.eval(0) + track.volume_db as f64,
                 fade_in_us: clip.audio.fade_in_us,
                 fade_out_us: clip.audio.fade_out_us,
@@ -79,6 +83,7 @@ pub fn load_items(
                 timeline_start: us_to_frames(spec.timeline_start_us),
                 src_in: us_to_frames(spec.src_in_us),
                 len: us_to_frames(spec.len_us),
+                speed: spec.speed,
                 gain: db_to_linear(spec.gain_db),
                 fade_in: us_to_frames(spec.fade_in_us),
                 fade_out: us_to_frames(spec.fade_out_us),

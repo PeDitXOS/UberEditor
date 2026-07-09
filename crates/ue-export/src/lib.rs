@@ -25,8 +25,6 @@ pub enum ExportError {
     NoSequence(Id),
     #[error("no hay nada que exportar (timeline vacío)")]
     EmptyTimeline,
-    #[error("clip con speed {0} ≠ 1.0: aún no soportado en export v0")]
-    SpeedUnsupported(f64),
     #[error("asset {0} no existe en el pool")]
     MissingAsset(Id),
     #[error("no se pudo ejecutar ffmpeg: {0}")]

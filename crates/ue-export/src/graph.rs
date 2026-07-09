@@ -30,9 +30,29 @@ struct AudioItem {
     src_in: TimeUs,
     src_out: TimeUs,
     start: TimeUs,
+    speed: f64,
     gain_db: f64,
     fade_in_us: TimeUs,
     fade_out_us: TimeUs,
+}
+
+/// Cadena atempo (preserva el pitch). atempo acepta 0.5–2 por instancia:
+/// se encadenan varias para factores extremos.
+fn atempo_chain(speed: f64) -> String {
+    let mut parts: Vec<String> = vec![];
+    let mut rest = speed;
+    while rest > 2.0 {
+        parts.push("atempo=2".into());
+        rest /= 2.0;
+    }
+    while rest < 0.5 {
+        parts.push("atempo=0.5".into());
+        rest /= 0.5;
+    }
+    if (rest - 1.0).abs() > 1e-9 {
+        parts.push(format!("atempo={}", (rest * 10000.0).round() / 10000.0));
+    }
+    parts.join(",")
 }
 
 fn collect_audio(project: &Project, sequence_id: Id) -> Vec<AudioItem> {
@@ -57,6 +77,7 @@ fn collect_audio(project: &Project, sequence_id: Id) -> Vec<AudioItem> {
                     src_in: *src_in,
                     src_out: *src_out,
                     start: clip.start,
+                    speed: clip.speed,
                     gain_db: clip.audio.gain_db.eval(0) + track.volume_db as f64,
                     fade_in_us: clip.audio.fade_in_us,
                     fade_out_us: clip.audio.fade_out_us,
@@ -160,26 +181,49 @@ fn build_text_overlays(
                         clip.end(),
                     ));
                 }
-                ClipPayload::Subtitles { transcript_id, style, .. } => {
+                ClipPayload::Subtitles { transcript_id, style, mode } => {
                     let Some(doc) =
                         project.transcripts.iter().find(|t| t.id == *transcript_id)
                     else {
                         continue;
                     };
-                    for seg in &doc.segments {
-                        let Some(tl_start) =
-                            asset_time_to_timeline(seq, doc.asset_id, seg.start_us)
+                    use ue_core::model::SubtitleMode;
+                    // modo frase: una línea por segmento; modo palabra/karaoke:
+                    // una palabra grande cada vez (estilo shorts)
+                    let items: Vec<(&str, i64, i64)> = match mode {
+                        SubtitleMode::Phrase => doc
+                            .segments
+                            .iter()
+                            .map(|s| (s.text.as_str(), s.start_us, s.end_us))
+                            .collect(),
+                        SubtitleMode::Word | SubtitleMode::Karaoke => doc
+                            .words
+                            .iter()
+                            .filter(|w| !w.rejected)
+                            .map(|w| (w.text.as_str(), w.start_us, w.end_us))
+                            .collect(),
+                    };
+                    let word_scale = match mode {
+                        SubtitleMode::Phrase => 1.0,
+                        _ => 1.6, // palabras sueltas más grandes
+                    };
+                    let mut wstyle = style.clone();
+                    wstyle.size *= word_scale as f32;
+                    for (text, s_us, e_us) in items {
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        let Some(tl_start) = asset_time_to_timeline(seq, doc.asset_id, s_us)
                         else {
                             continue; // ese trozo del asset no está en el timeline
                         };
-                        let tl_end = tl_start + (seg.end_us - seg.start_us);
-                        // solo dentro del rango del clip de subtítulos
+                        let tl_end = tl_start + (e_us - s_us);
                         let from = tl_start.max(clip.start);
                         let to = tl_end.min(clip.end());
                         if to <= from {
                             continue;
                         }
-                        parts.push(drawtext_for(&font_part, &seg.text, style, scale, from, to));
+                        parts.push(drawtext_for(&font_part, text, &wstyle, scale, from, to));
                     }
                 }
                 _ => {}
@@ -346,14 +390,19 @@ pub fn build_ffmpeg_args(
     for (k, seg) in edl.iter().enumerate() {
         let label = format!("v{k}");
         match seg {
-            Segment::Source { asset_id, src_in, src_out, vf, .. } => {
+            Segment::Source { asset_id, src_in, src_out, speed, vf, .. } => {
                 let idx = input_of(*asset_id, project);
                 let effects = match vf {
                     Some(chain) => format!("{chain},"),
                     None => String::new(),
                 };
+                let setpts = if (*speed - 1.0).abs() > 1e-9 {
+                    format!("setpts=(PTS-STARTPTS)/{speed}")
+                } else {
+                    "setpts=PTS-STARTPTS".to_string()
+                };
                 fc.push(format!(
-                    "[{idx}:v]trim=start={}:end={},setpts=PTS-STARTPTS,{effects}{norm}[{label}]",
+                    "[{idx}:v]trim=start={}:end={},{setpts},{effects}{norm}[{label}]",
                     secs(*src_in),
                     secs(*src_out),
                 ));
@@ -413,13 +462,17 @@ pub fn build_ffmpeg_args(
     for (k, item) in audio_items.iter().enumerate() {
         let idx = input_of(item.asset_id, project);
         let label = format!("a{k}");
-        let dur_us = item.src_out - item.src_in;
+        let dur_us = (((item.src_out - item.src_in) as f64) / item.speed).round() as TimeUs;
         let mut chain = format!(
             "[{idx}:a]atrim=start={}:end={},asetpts=PTS-STARTPTS,\
              aresample=48000,aformat=channel_layouts=stereo",
             secs(item.src_in),
             secs(item.src_out),
         );
+        if (item.speed - 1.0).abs() > 1e-9 {
+            chain.push(',');
+            chain.push_str(&atempo_chain(item.speed));
+        }
         if item.gain_db.abs() > 1e-9 {
             chain.push_str(&format!(",volume={:.2}dB", item.gain_db));
         }

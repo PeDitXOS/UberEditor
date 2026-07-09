@@ -78,6 +78,11 @@ export interface EngineClient {
   /** Añade un clip de título en la pista de video superior. */
   addTextClip(content: string, atUs: TimeUs): Promise<StateSnapshot>;
   setClipText(clipId: Id, content: string, style: TextStyle): Promise<StateSnapshot>;
+  setSubtitlesProps(
+    clipId: Id,
+    style: TextStyle,
+    mode: "phrase" | "word" | "karaoke",
+  ): Promise<StateSnapshot>;
   setTrackProp(
     trackId: Id,
     prop: "muted" | "solo" | "locked",
@@ -113,8 +118,14 @@ export interface EngineClient {
   /** Lanza la transcripción Whisper de un asset (job en segundo plano). */
   transcribeAsset(assetId: Id, model?: string): Promise<void>;
 
-  /** Elimina silencios de un clip; devuelve nº de cortes y µs eliminados. */
-  removeSilences(clipId: Id): Promise<{ removed: number; removed_us: number; snapshot: StateSnapshot }>;
+  /** Cambia la velocidad de un clip (0.05–20; el export preserva el pitch). */
+  setClipSpeed(clipId: Id, speed: number): Promise<StateSnapshot>;
+
+  /** Silencios de un clip: mode "delete" corta, "speedup" acelera 4x. */
+  removeSilences(
+    clipId: Id,
+    mode: "delete" | "speedup",
+  ): Promise<{ removed: number; removed_us: number; snapshot: StateSnapshot }>;
 
   /** Puerto del servidor MCP embebido (null si no está activo). */
   mcpStatus(): Promise<number | null>;

@@ -69,6 +69,7 @@ function ClipInspector({ clip }: { clip: Clip }) {
   const setClipAudio = useStore((s) => s.setClipAudio);
   const setClipTransform = useStore((s) => s.setClipTransform);
   const removeSilences = useStore((s) => s.removeSilences);
+  const setClipSpeed = useStore((s) => s.setClipSpeed);
   const addSubtitlesClip = useStore((s) => s.addSubtitlesClip);
   const addAvatarClip = useStore((s) => s.addAvatarClip);
   const fps = activeSequence(project).fps;
@@ -96,6 +97,38 @@ function ClipInspector({ clip }: { clip: Clip }) {
       </div>
 
       <Section title="Transformación">
+        <Row label="Posición X">
+          <Slider
+            value={paramValue(clip.transform.position[0])}
+            min={-960}
+            max={960}
+            step={2}
+            unit=" px"
+            disabled={isCurve(clip.transform.position[0])}
+            onChange={(v) =>
+              void setClipTransform(clip.id, {
+                ...clip.transform,
+                position: [v, clip.transform.position[1]],
+              })
+            }
+          />
+        </Row>
+        <Row label="Posición Y">
+          <Slider
+            value={paramValue(clip.transform.position[1])}
+            min={-540}
+            max={540}
+            step={2}
+            unit=" px"
+            disabled={isCurve(clip.transform.position[1])}
+            onChange={(v) =>
+              void setClipTransform(clip.id, {
+                ...clip.transform,
+                position: [clip.transform.position[0], v],
+              })
+            }
+          />
+        </Row>
         <Row label="Opacidad">
           <Slider
             value={opacity}
@@ -167,6 +200,31 @@ function ClipInspector({ clip }: { clip: Clip }) {
         </Row>
       </Section>
 
+      {clip.payload.type === "media" && (
+        <Section title="Velocidad">
+          <div className="flex flex-wrap gap-1">
+            {[0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4].map((v) => (
+              <button
+                key={v}
+                className={`focus-ring rounded-md border px-2 py-1 text-[11px] ${
+                  Math.abs(clip.speed - v) < 1e-9
+                    ? "border-accent bg-accent/15 text-accent"
+                    : "border-line text-ink-dim hover:text-ink"
+                }`}
+                onClick={() => void setClipSpeed(clip.id, v)}
+                title={`Reproducir a ${v}× (el export conserva el tono, como YouTube)`}
+              >
+                {v}×
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[10px] leading-snug text-ink-faint">
+            El clip {clip.speed > 1 ? "se acorta" : clip.speed < 1 ? "se alarga" : "no cambia"};
+            en el export el tono de la voz se conserva (atempo).
+          </p>
+        </Section>
+      )}
+
       {clip.payload.type === "media" && asset && (
         <Section title="Fuente">
           <div className="space-y-1 text-[11px]">
@@ -182,16 +240,26 @@ function ClipInspector({ clip }: { clip: Clip }) {
       )}
 
       {clip.payload.type === "text" && <TextPanel clip={clip} />}
+      {clip.payload.type === "subtitles" && <SubtitlesPanel clip={clip} />}
 
       {clip.payload.type === "media" && asset && asset.probe.audio_channels > 0 && (
         <Section title="Silencios">
-          <button
-            className="focus-ring w-full rounded-md border border-line bg-bg2 px-2.5 py-2 text-[12px] text-ink hover:bg-bg3"
-            onClick={() => void removeSilences(clip.id)}
-            title="Detecta silencios en este clip y los corta cerrando los huecos (una sola acción de deshacer)"
-          >
-            🔇 Eliminar silencios del clip
-          </button>
+          <div className="flex gap-1.5">
+            <button
+              className="focus-ring flex-1 rounded-md border border-line bg-bg2 px-2 py-2 text-[12px] text-ink hover:bg-bg3"
+              onClick={() => void removeSilences(clip.id, "delete")}
+              title="Detecta silencios y los corta cerrando los huecos (1 deshacer)"
+            >
+              🔇 Eliminar
+            </button>
+            <button
+              className="focus-ring flex-1 rounded-md border border-line bg-bg2 px-2 py-2 text-[12px] text-ink hover:bg-bg3"
+              onClick={() => void removeSilences(clip.id, "speedup")}
+              title="Detecta silencios y los acelera 4× en lugar de cortarlos (1 deshacer)"
+            >
+              ⏩ Acelerar 4×
+            </button>
+          </div>
           {asset.transcript && (
             <>
               <button
@@ -267,6 +335,59 @@ function TextPanel({ clip }: { clip: Clip }) {
       <p className="mt-1 text-[10px] leading-snug text-ink-faint">
         Tamaño y altura referidos a 1080p; se escalan al exportar.
       </p>
+    </Section>
+  );
+}
+
+function SubtitlesPanel({ clip }: { clip: Clip }) {
+  const setSubtitlesProps = useStore((s) => s.setSubtitlesProps);
+  if (clip.payload.type !== "subtitles") return null;
+  const { style, mode } = clip.payload;
+
+  return (
+    <Section title="Subtítulos">
+      <Row label="Modo">
+        <select
+          className="focus-ring min-w-0 flex-1 cursor-pointer rounded-md border border-line bg-bg2 px-2 py-1 text-[12px] text-ink"
+          value={mode}
+          onChange={(e) =>
+            void setSubtitlesProps(clip.id, style, e.target.value as "phrase" | "word")
+          }
+          title="Frase completa o palabra a palabra (estilo shorts)"
+        >
+          <option value="phrase">Por frases</option>
+          <option value="word">Palabra a palabra</option>
+        </select>
+      </Row>
+      <Row label="Tamaño">
+        <Slider
+          value={style.size}
+          min={16}
+          max={160}
+          step={1}
+          unit=" px"
+          onChange={(v) => void setSubtitlesProps(clip.id, { ...style, size: v }, mode)}
+        />
+      </Row>
+      <Row label="Color">
+        <input
+          type="color"
+          className="h-6 w-10 cursor-pointer rounded border border-line bg-transparent"
+          value={style.color}
+          onChange={(e) => void setSubtitlesProps(clip.id, { ...style, color: e.target.value }, mode)}
+        />
+        <span className="font-[var(--font-mono)] text-[10px] text-ink-faint">{style.color}</span>
+      </Row>
+      <Row label="Altura">
+        <Slider
+          value={style.y_offset}
+          min={-500}
+          max={500}
+          step={5}
+          unit=" px"
+          onChange={(v) => void setSubtitlesProps(clip.id, { ...style, y_offset: v }, mode)}
+        />
+      </Row>
     </Section>
   );
 }

@@ -81,10 +81,10 @@ fn edl_with_gap_and_two_sources() {
     assert_eq!(
         edl,
         vec![
-            Segment::Source { asset_id: a, src_in: 1 * SEC, src_out: 3 * SEC, vf: None, transition_in: None },
-            Segment::Source { asset_id: b, src_in: 4 * SEC, src_out: 6 * SEC, vf: None, transition_in: None },
+            Segment::Source { asset_id: a, src_in: 1 * SEC, src_out: 3 * SEC, speed: 1.0, vf: None, transition_in: None },
+            Segment::Source { asset_id: b, src_in: 4 * SEC, src_out: 6 * SEC, speed: 1.0, vf: None, transition_in: None },
             Segment::Black { duration: 1 * SEC },
-            Segment::Source { asset_id: a, src_in: 8 * SEC, src_out: 9 * SEC, vf: None, transition_in: None },
+            Segment::Source { asset_id: a, src_in: 8 * SEC, src_out: 9 * SEC, speed: 1.0, vf: None, transition_in: None },
         ]
     );
     assert_eq!(edl_duration(&edl), 6 * SEC);
@@ -101,9 +101,9 @@ fn edl_top_track_wins() {
     assert_eq!(
         edl,
         vec![
-            Segment::Source { asset_id: a, src_in: 0, src_out: 2 * SEC, vf: None, transition_in: None },
-            Segment::Source { asset_id: b, src_in: 0, src_out: 2 * SEC, vf: None, transition_in: None },
-            Segment::Source { asset_id: a, src_in: 4 * SEC, src_out: 6 * SEC, vf: None, transition_in: None },
+            Segment::Source { asset_id: a, src_in: 0, src_out: 2 * SEC, speed: 1.0, vf: None, transition_in: None },
+            Segment::Source { asset_id: b, src_in: 0, src_out: 2 * SEC, speed: 1.0, vf: None, transition_in: None },
+            Segment::Source { asset_id: a, src_in: 4 * SEC, src_out: 6 * SEC, speed: 1.0, vf: None, transition_in: None },
         ]
     );
 }
@@ -117,25 +117,31 @@ fn edl_merges_contiguous_and_trims_trailing_black() {
     let edl = build_video_edl(&store.project, seq).unwrap();
     assert_eq!(
         edl,
-        vec![Segment::Source { asset_id: a, src_in: 1 * SEC, src_out: 5 * SEC, vf: None, transition_in: None }]
+        vec![Segment::Source { asset_id: a, src_in: 1 * SEC, src_out: 5 * SEC, speed: 1.0, vf: None, transition_in: None }]
     );
 }
 
 #[test]
-fn edl_rejects_speed_and_empty() {
+fn edl_supports_speed_and_rejects_empty() {
     let (mut store, seq, v1, _v2, _a1, a, _b) = project_two_video_tracks();
     assert!(matches!(
         build_video_edl(&store.project, seq),
         Err(ExportError::EmptyTimeline)
     ));
+    // clip a 2×: usa [0..2s) de la fuente en 1 s de timeline
     let mut clip = Clip::new_media(a, 0, 2 * SEC, 0);
     clip.speed = 2.0;
     clip.duration = 1 * SEC;
     store.insert_clip(v1, clip, InsertMode::Strict).unwrap();
-    assert!(matches!(
-        build_video_edl(&store.project, seq),
-        Err(ExportError::SpeedUnsupported(_))
-    ));
+    let edl = build_video_edl(&store.project, seq).unwrap();
+    match &edl[0] {
+        Segment::Source { src_in, src_out, speed, .. } => {
+            assert_eq!((*src_in, *src_out), (0, 2 * SEC), "consume toda la fuente");
+            assert_eq!(*speed, 2.0);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(edl_duration(&edl), 1 * SEC, "1 s de salida a 2×");
 }
 
 #[test]
@@ -887,4 +893,133 @@ fn avatar_overlay_switches_emotion_per_segment() {
     // fuera del avatar el video base sigue visible (testsrc: no negro)
     let (r, g, b) = pixel_at(&out, 1.0, 400, 300);
     assert!(r as u32 + g as u32 + b as u32 > 100, "el video base sigue debajo");
+}
+
+/// Velocidad 2× real: el contador de testsrc avanza el doble por segundo de
+/// salida, la duración se reduce a la mitad y el audio lleva atempo (pitch OK).
+#[test]
+fn speed_2x_export_halves_duration_and_doubles_counter() {
+    let Some(dir) = media_dir() else { return };
+    let mut project = Project::new("speed-test");
+    let seq_id = project.active_sequence;
+    let asset = ue_media::import_file(&dir.join("counter.mp4")).unwrap();
+    let aid = asset.id;
+    project.assets.push(asset);
+    let v1 = project
+        .sequence(seq_id)
+        .unwrap()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Video)
+        .unwrap()
+        .id;
+    let mut store = ProjectStore::new(project);
+    // fuente [0..6s) a 2× → 3 s de salida
+    let clip_id = store
+        .insert_clip(v1, Clip::new_media(aid, 0, 6 * SEC, 0), InsertMode::Strict)
+        .unwrap();
+    store.set_clip_speed(clip_id, 2.0).unwrap();
+    assert_eq!(store.project.clip(clip_id).unwrap().duration, 3 * SEC);
+
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ue-speed-out.mp4");
+    export_sequence(&store.project, seq_id, dir, &out, &ExportSettings::default()).unwrap();
+
+    let meta = ffprobe_json(&out);
+    let dur: f64 = meta["format"]["duration"].as_str().unwrap().parse().unwrap();
+    assert!((2.9..=3.2).contains(&dur), "≈3 s de salida, fue {dur}");
+    assert!(
+        meta["streams"].as_array().unwrap().iter().any(|s| s["codec_type"] == "audio"),
+        "el audio sobrevive con atempo"
+    );
+
+    // el contador (dígito grande del testsrc) en t=1 de salida debe ser "2"
+    // (fuente 2s), y en t=2.5 debe ser "5". Verificación visual: extraer frames.
+    let frames_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ue-speed-frames");
+    std::fs::create_dir_all(&frames_dir).unwrap();
+    for (name, t) in [("salida2x_1s", 1.0f64), ("salida2x_2.5s", 2.5)] {
+        let st = Command::new(ue_media::ffmpeg_bin())
+            .args(["-y", "-v", "error", "-ss", &t.to_string(), "-i"])
+            .arg(&out)
+            .args(["-frames:v", "1"])
+            .arg(frames_dir.join(format!("{name}.jpg")))
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+    eprintln!("frames de velocidad en {}", frames_dir.display());
+}
+
+/// Modo palabra a palabra: cada palabra aparece sola en su instante exacto.
+#[test]
+fn word_mode_subtitles_burn_per_word() {
+    let Some(dir) = media_dir() else { return };
+    let src = dir.join("black_words.mp4");
+    let st = Command::new(ue_media::ffmpeg_bin())
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:d=3:r=30"])
+        .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    let mut project = Project::new("word-subs");
+    let seq_id = project.active_sequence;
+    let asset = ue_media::import_file(&src).unwrap();
+    let aid = asset.id;
+    project.assets.push(asset);
+    let doc_id = Id::new();
+    project.transcripts.push(TranscriptDoc {
+        id: doc_id,
+        asset_id: aid,
+        language: "es".into(),
+        model: "t".into(),
+        words: vec![
+            Word { text: "UNO".into(), start_us: 300_000, end_us: 800_000, confidence: 1.0, rejected: false },
+            Word { text: "DOS".into(), start_us: 1_500_000, end_us: 2_000_000, confidence: 1.0, rejected: false },
+            Word { text: "IGNORADA".into(), start_us: 2_300_000, end_us: 2_600_000, confidence: 1.0, rejected: true },
+        ],
+        segments: vec![],
+        global_avg_volume: 0.0,
+    });
+    let seq = project.sequence_mut(seq_id).unwrap();
+    seq.tracks.push(Track::new(TrackKind::Video, "V2"));
+    let v2 = seq.tracks.last().unwrap().id;
+    let v1 = seq.tracks.iter().find(|t| t.kind == TrackKind::Video && t.name == "V1").unwrap().id;
+    let mut store = ProjectStore::new(project);
+    store.insert_clip(v1, Clip::new_media(aid, 0, 3 * SEC, 0), InsertMode::Strict).unwrap();
+    let subs = Clip {
+        id: Id::new(),
+        payload: ClipPayload::Subtitles {
+            transcript_id: doc_id,
+            style: TextStyle { size: 80.0, y_offset: 380.0, ..Default::default() },
+            mode: SubtitleMode::Word,
+        },
+        start: 0,
+        duration: 3 * SEC,
+        speed: 1.0,
+        effects: vec![],
+        transform: Default::default(),
+        audio: Default::default(),
+        transition_in: None,
+        label_color: None,
+    };
+    store.insert_clip(v2, subs, InsertMode::Strict).unwrap();
+
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ue-wordsubs-out.mp4");
+    export_sequence(&store.project, seq_id, dir, &out, &ExportSettings::default()).unwrap();
+
+    let bright_at = |t: f64| -> usize {
+        let mut n = 0;
+        for y in [890u32, 920, 950] {
+            for x in (700..1300).step_by(20) {
+                let (r, g, b) = pixel_at(&out, t, x, y);
+                if r as u32 + g as u32 + b as u32 > 380 { n += 1; }
+            }
+        }
+        n
+    };
+    assert!(bright_at(0.5) >= 2, "UNO visible en t=0.5 ({})", bright_at(0.5));
+    assert_eq!(bright_at(1.1), 0, "hueco entre palabras limpio");
+    assert!(bright_at(1.7) >= 2, "DOS visible en t=1.7 ({})", bright_at(1.7));
+    assert_eq!(bright_at(2.4), 0, "las palabras rechazadas no se queman");
 }

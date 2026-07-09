@@ -38,6 +38,11 @@ pub enum Action {
     SetClipTransition { clip_id: Id, transition: Option<TransitionRef> },
     /// Cambia contenido y estilo de un clip de texto (payload Text).
     SetClipText { clip_id: Id, content: String, style: TextStyle },
+    /// Cambia estilo y modo de un clip de subtítulos (payload Subtitles).
+    SetClipSubtitles { clip_id: Id, style: TextStyle, mode: SubtitleMode },
+    /// Cambia la velocidad de un clip media (rate stretch: mismo material
+    /// fuente, duración = fuente/velocidad). `duration` viene precalculada.
+    SetClipSpeed { clip_id: Id, speed: f64, duration: TimeUs },
     AddSequence { sequence: Sequence },
     RemoveSequence { sequence_id: Id },
     SetActiveSequence { sequence_id: Id },
@@ -311,6 +316,43 @@ pub fn apply(project: &mut Project, action: Action) -> UeResult<Action> {
                     Ok(Action::SetClipText { clip_id, content: old_content, style: old_style })
                 }
                 _ => Err(UeError::Invalid("el clip no es de texto".into())),
+            }
+        }
+
+        Action::SetClipSpeed { clip_id, speed, duration } => {
+            if speed <= 0.0 || duration <= 0 {
+                return Err(UeError::Invalid("velocidad o duración inválida".into()));
+            }
+            let (si, ti, ci) = project
+                .locate_clip(clip_id)
+                .ok_or_else(|| UeError::NotFound(format!("clip {clip_id}")))?;
+            let track = &project.sequences[si].tracks[ti];
+            let start = track.clips[ci].start;
+            if track.collides(start, duration, Some(clip_id)) {
+                return Err(UeError::Overlap(format!(
+                    "cambiar la velocidad de {clip_id} chocaría con el siguiente clip"
+                )));
+            }
+            let clip = &mut project.sequences[si].tracks[ti].clips[ci];
+            let old_speed = clip.speed;
+            let old_duration = clip.duration;
+            clip.speed = speed;
+            clip.duration = duration;
+            Ok(Action::SetClipSpeed { clip_id, speed: old_speed, duration: old_duration })
+        }
+
+        Action::SetClipSubtitles { clip_id, style, mode } => {
+            let (si, ti, ci) = project
+                .locate_clip(clip_id)
+                .ok_or_else(|| UeError::NotFound(format!("clip {clip_id}")))?;
+            let clip = &mut project.sequences[si].tracks[ti].clips[ci];
+            match &mut clip.payload {
+                ClipPayload::Subtitles { style: st, mode: md, .. } => {
+                    let old_style = std::mem::replace(st, style);
+                    let old_mode = std::mem::replace(md, mode);
+                    Ok(Action::SetClipSubtitles { clip_id, style: old_style, mode: old_mode })
+                }
+                _ => Err(UeError::Invalid("el clip no es de subtítulos".into())),
             }
         }
 

@@ -110,7 +110,14 @@ fn frame_service_loop(app: tauri::AppHandle, latest: Arc<Mutex<Vec<u8>>>, runnin
         let path = PathBuf::from(&r.asset_path);
         let src_t = r.src_t_us;
         let reg = state.registry.lock().unwrap().clone();
-        let vf = ue_render::clip_vf(&reg, &r.effects, &r.transform);
+        let canvas = {
+            let store = state.store.lock().unwrap();
+            store
+                .project
+                .sequence(store.project.active_sequence)
+                .map(|s| s.resolution)
+        };
+        let vf = ue_render::clip_vf(&reg, &r.effects, &r.transform, canvas);
 
         // ¿sirve la sesión actual? (mismo archivo, misma cadena de efectos,
         // posición alcanzable hacia delante)
@@ -280,6 +287,32 @@ fn cut_ranges(
     store
         .cut_ranges(parse_id(&sequence_id)?, &ranges, ripple)
         .map_err(|e| e.to_string())?;
+    Ok(snapshot(&store))
+}
+
+#[tauri::command]
+fn set_subtitles_props(
+    state: State<AppState>,
+    clip_id: String,
+    style: ue_core::model::TextStyle,
+    mode: ue_core::model::SubtitleMode,
+) -> Res<StateSnapshot> {
+    let mut store = state.store.lock().unwrap();
+    let id = parse_id(&clip_id)?;
+    store
+        .dispatch(
+            "Editar subtítulos",
+            vec![ue_core::Action::SetClipSubtitles { clip_id: id, style, mode }],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(snapshot(&store))
+}
+
+/// Cambia la velocidad de un clip (rate stretch, pitch preservado en export).
+#[tauri::command]
+fn set_clip_speed(state: State<AppState>, clip_id: String, speed: f64) -> Res<StateSnapshot> {
+    let mut store = state.store.lock().unwrap();
+    store.set_clip_speed(parse_id(&clip_id)?, speed).map_err(|e| e.to_string())?;
     Ok(snapshot(&store))
 }
 
@@ -584,8 +617,9 @@ fn render_frame(
         (store.project.clone(), store.project.active_sequence, base)
     }; // soltar el lock antes de invocar ffmpeg
     let reg = state.registry.lock().unwrap().clone();
+    let canvas = project.sequence(seq_id).map(|s| s.resolution);
     let mut vf = ue_media::frame::resolve_top_video(&project, seq_id, t_us)
-        .and_then(|r| ue_render::clip_vf(&reg, &r.effects, &r.transform));
+        .and_then(|r| ue_render::clip_vf(&reg, &r.effects, &r.transform, canvas));
     // avatar sobre el frame pausado (grafo movie+overlay en el mismo -vf)
     if let Some(suffix) = avatar_vf_suffix(&project, seq_id, t_us, max_width) {
         vf = Some(format!("{}{}", vf.unwrap_or_else(|| "null".into()), suffix));
@@ -898,7 +932,11 @@ fn transcribe_asset(
 /// Elimina los silencios de un clip (corta y cierra huecos en TODAS las
 /// pistas: una sola entrada de undo). Requiere el audio conformado.
 #[tauri::command]
-fn remove_silences(state: State<AppState>, clip_id: String) -> Res<serde_json::Value> {
+fn remove_silences(
+    state: State<AppState>,
+    clip_id: String,
+    mode: Option<String>,
+) -> Res<serde_json::Value> {
     let id = parse_id(&clip_id)?;
     let mut store = state.store.lock().unwrap();
     let clip = store.project.clip(id).ok_or("clip no encontrado")?.clone();
@@ -919,7 +957,14 @@ fn remove_silences(state: State<AppState>, clip_id: String) -> Res<serde_json::V
     }
     let removed_us: i64 = ranges.iter().map(|(s, e)| e - s).sum();
     let seq_id = store.project.active_sequence;
-    store.cut_ranges(seq_id, &ranges, true).map_err(|e| e.to_string())?;
+    match mode.as_deref() {
+        Some("speedup") => {
+            store.speedup_ranges(seq_id, &ranges, 4.0).map_err(|e| e.to_string())?;
+        }
+        _ => {
+            store.cut_ranges(seq_id, &ranges, true).map_err(|e| e.to_string())?;
+        }
+    }
     Ok(serde_json::json!({
         "removed": ranges.len(),
         "removed_us": removed_us,
@@ -1147,6 +1192,8 @@ pub fn run() {
             trim_clip,
             cut_ranges,
             move_range,
+            set_clip_speed,
+            set_subtitles_props,
             undo,
             redo,
             set_clip_audio,

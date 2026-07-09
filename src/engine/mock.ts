@@ -417,6 +417,16 @@ export class MockEngine implements EngineClient {
     throw new Error("Transcribir requiere la app de escritorio (npx tauri dev)");
   }
 
+  async setClipSpeed(clipId: Id, speed: number): Promise<StateSnapshot> {
+    return this.transaction("Cambiar velocidad", () => {
+      const found = this.locate(clipId);
+      if (!found || found.clip.payload.type !== "media") throw new Error("clip inválido");
+      const srcLen = found.clip.payload.src_out - found.clip.payload.src_in;
+      found.clip.speed = speed;
+      found.clip.duration = Math.max(33_333, Math.round(srcLen / speed));
+    });
+  }
+
   async removeSilences(): Promise<{ removed: number; removed_us: number; snapshot: StateSnapshot }> {
     throw new Error("Eliminar silencios requiere la app de escritorio (npx tauri dev)");
   }
@@ -444,6 +454,20 @@ export class MockEngine implements EngineClient {
       const clip = textClip(content, start / S, duration / S);
       track.clips.push(clip);
       track.clips.sort((a, b) => a.start - b.start);
+    });
+  }
+
+  async setSubtitlesProps(
+    clipId: Id,
+    style: TextStyle,
+    mode: "phrase" | "word" | "karaoke",
+  ): Promise<StateSnapshot> {
+    return this.transaction("Editar subtítulos", () => {
+      const found = this.locate(clipId);
+      if (!found || found.clip.payload.type !== "subtitles")
+        throw new Error("no es un clip de subtítulos");
+      found.clip.payload.style = style;
+      found.clip.payload.mode = mode;
     });
   }
 

@@ -128,6 +128,21 @@ impl ProjectStore {
         self.dispatch("Recortar clip", actions)
     }
 
+    pub fn set_clip_speed(&mut self, clip_id: Id, speed: f64) -> UeResult<()> {
+        let actions = ops::set_clip_speed(&self.project, clip_id, speed)?;
+        self.dispatch("Cambiar velocidad", actions)
+    }
+
+    pub fn speedup_ranges(
+        &mut self,
+        sequence_id: Id,
+        ranges: &[(TimeUs, TimeUs)],
+        factor: f64,
+    ) -> UeResult<()> {
+        let actions = ops::speedup_ranges(&self.project, sequence_id, ranges, factor)?;
+        self.dispatch("Acelerar rangos", actions)
+    }
+
     pub fn move_range(
         &mut self,
         sequence_id: Id,

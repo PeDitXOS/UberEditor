@@ -429,6 +429,137 @@ fn media_src(c: &Clip) -> (Option<TimeUs>, Option<TimeUs>) {
     }
 }
 
+/// Cambia la velocidad de un clip media (rate stretch). La duración nueva se
+/// cuantiza a frame; error si chocaría con el siguiente clip.
+pub fn set_clip_speed(project: &Project, clip_id: Id, speed: f64) -> UeResult<Vec<Action>> {
+    if !(0.05..=20.0).contains(&speed) {
+        return Err(UeError::Invalid("velocidad fuera de rango (0.05–20)".into()));
+    }
+    let (si, ti, ci) = project
+        .locate_clip(clip_id)
+        .ok_or_else(|| UeError::NotFound(format!("clip {clip_id}")))?;
+    let seq = &project.sequences[si];
+    ensure_unlocked(&seq.tracks[ti])?;
+    let clip = &seq.tracks[ti].clips[ci];
+    let ClipPayload::Media { src_in, src_out, .. } = &clip.payload else {
+        return Err(UeError::Invalid("solo los clips de media tienen velocidad".into()));
+    };
+    let src_len = src_out - src_in;
+    let duration = quantize_to_frame(((src_len as f64) / speed).round() as TimeUs, seq.fps)
+        .max(frame_duration_us(seq.fps));
+    let mut plan = Planner::new(project);
+    plan.do_(Action::SetClipSpeed { clip_id, speed, duration })?;
+    Ok(plan.finish())
+}
+
+/// Acelera los rangos dados (p. ej. silencios): corta en fronteras, aplica
+/// `factor` a los clips interiores (que encogen) y cierra los huecos con
+/// ripple. Multi-pista, una transacción.
+pub fn speedup_ranges(
+    project: &Project,
+    sequence_id: Id,
+    ranges: &[(TimeUs, TimeUs)],
+    factor: f64,
+) -> UeResult<Vec<Action>> {
+    if factor <= 1.0 {
+        return Err(UeError::Invalid("el factor de aceleración debe ser > 1".into()));
+    }
+    let seq = project
+        .sequence(sequence_id)
+        .ok_or_else(|| UeError::NotFound(format!("secuencia {sequence_id}")))?;
+    let fps = seq.fps;
+    let track_ids: Vec<Id> = seq.tracks.iter().filter(|t| !t.locked).map(|t| t.id).collect();
+
+    // normalizar y ordenar de DERECHA a IZQUIERDA: al encoger un rango se
+    // desplazan los posteriores, así que procesando de atrás hacia delante
+    // los rangos anteriores no se invalidan.
+    let mut rs: Vec<(TimeUs, TimeUs)> = ranges
+        .iter()
+        .map(|(a, b)| (quantize_to_frame((*a).max(0), fps), quantize_to_frame(*b, fps)))
+        .filter(|(a, b)| b > a)
+        .collect();
+    rs.sort();
+    rs.reverse();
+
+    let mut plan = Planner::new(project);
+    for (from, to) in rs {
+        split_all_at(&mut plan, &track_ids, from)?;
+        split_all_at(&mut plan, &track_ids, to)?;
+        let len = to - from;
+        // encoger los clips interiores
+        let mut shrunk_by: TimeUs = 0;
+        for tid in &track_ids {
+            let inside: Vec<Clip> = plan
+                .proj
+                .track(*tid)
+                .unwrap()
+                .clips
+                .iter()
+                .filter(|c| c.start >= from && c.end() <= to)
+                .cloned()
+                .collect();
+            for c in inside {
+                if let ClipPayload::Media { src_in, src_out, .. } = &c.payload {
+                    let src_len = src_out - src_in;
+                    let new_speed = c.speed * factor;
+                    let new_dur =
+                        quantize_to_frame(((src_len as f64) / new_speed).round() as TimeUs, fps)
+                            .max(frame_duration_us(fps));
+                    // reposicionar proporcionalmente dentro del rango encogido
+                    let rel = c.start - from;
+                    let new_start = from + quantize_to_frame(
+                        ((rel as f64) / factor).round() as TimeUs,
+                        fps,
+                    );
+                    plan.do_(Action::SetClipSpeed {
+                        clip_id: c.id,
+                        speed: new_speed,
+                        duration: new_dur,
+                    })?;
+                    // mover a la izquierda no colisiona: procesamos rangos de
+                    // derecha a izquierda y dentro del rango en orden natural
+                    plan.do_(Action::SetClipBounds {
+                        clip_id: c.id,
+                        start: new_start,
+                        duration: new_dur,
+                        src_in: None,
+                        src_out: None,
+                    })?;
+                    shrunk_by = shrunk_by.max(len - quantize_to_frame(
+                        ((len as f64) / factor).round() as TimeUs,
+                        fps,
+                    ));
+                }
+            }
+        }
+        // cerrar el hueco: todo lo que empiece en >= to se desplaza a la izquierda
+        let shift = shrunk_by;
+        if shift > 0 {
+            for tid in &track_ids {
+                let after: Vec<(Id, TimeUs, TimeUs)> = plan
+                    .proj
+                    .track(*tid)
+                    .unwrap()
+                    .clips
+                    .iter()
+                    .filter(|c| c.start >= to)
+                    .map(|c| (c.id, c.start, c.duration))
+                    .collect();
+                for (cid, start, duration) in after {
+                    plan.do_(Action::SetClipBounds {
+                        clip_id: cid,
+                        start: start - shift,
+                        duration,
+                        src_in: None,
+                        src_out: None,
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(plan.finish())
+}
+
 /// Divide en `t` cualquier clip que lo cruce, en todas las pistas dadas.
 fn split_all_at(plan: &mut Planner, track_ids: &[Id], t: TimeUs) -> UeResult<()> {
     for tid in track_ids {

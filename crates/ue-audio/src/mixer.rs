@@ -9,8 +9,11 @@ pub struct MixItem {
     pub timeline_start: i64,
     /// Offset dentro del WAV donde empieza el clip (frames).
     pub src_in: i64,
-    /// Duración del clip en frames.
+    /// Duración del clip en frames (de TIMELINE, ya dividida por speed).
     pub len: i64,
+    /// Velocidad del clip: la fuente se lee a este ritmo. En vivo cambia el
+    /// pitch (remuestreo simple); el export preserva pitch con atempo.
+    pub speed: f64,
     /// Ganancia lineal (clip gain_db + volumen de pista, ya convertidos).
     pub gain: f32,
     pub fade_in: i64,
@@ -48,7 +51,12 @@ pub fn mix_frame(items: &[MixItem], pos: i64) -> (f32, f32) {
         if rel < 0 || rel >= item.len {
             continue;
         }
-        let (l, r) = item.wav.frame(item.src_in + rel);
+        let src_rel = if (item.speed - 1.0).abs() > 1e-9 {
+            (rel as f64 * item.speed).round() as i64
+        } else {
+            rel
+        };
+        let (l, r) = item.wav.frame(item.src_in + src_rel);
         let g = item.factor_at(rel);
         acc.0 += l * g;
         acc.1 += r * g;

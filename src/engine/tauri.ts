@@ -162,6 +162,13 @@ export class TauriEngine implements EngineClient {
   setClipText(clipId: Id, content: string, style: TextStyle): Promise<StateSnapshot> {
     return invoke("set_clip_text", { clipId, content, style });
   }
+  setSubtitlesProps(
+    clipId: Id,
+    style: TextStyle,
+    mode: "phrase" | "word" | "karaoke",
+  ): Promise<StateSnapshot> {
+    return invoke("set_subtitles_props", { clipId, style, mode });
+  }
   setTrackProp(
     trackId: Id,
     prop: "muted" | "solo" | "locked",
@@ -214,10 +221,15 @@ export class TauriEngine implements EngineClient {
     return invoke("transcribe_asset", { assetId, model: model ?? null });
   }
 
+  setClipSpeed(clipId: Id, speed: number): Promise<StateSnapshot> {
+    return invoke("set_clip_speed", { clipId, speed });
+  }
+
   removeSilences(
     clipId: Id,
+    mode: "delete" | "speedup",
   ): Promise<{ removed: number; removed_us: number; snapshot: StateSnapshot }> {
-    return invoke("remove_silences", { clipId });
+    return invoke("remove_silences", { clipId, mode });
   }
 
   mcpStatus(): Promise<number | null> {

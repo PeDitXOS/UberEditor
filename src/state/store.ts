@@ -61,7 +61,8 @@ export interface UiState {
   setClipTransition: (clipId: Id, transition: TransitionRef | null) => Promise<void>;
   reloadEffectPacks: () => Promise<void>;
   addTextClip: () => Promise<void>;
-  removeSilences: (clipId: Id) => Promise<void>;
+  removeSilences: (clipId: Id, mode: "delete" | "speedup") => Promise<void>;
+  setClipSpeed: (clipId: Id, speed: number) => Promise<void>;
   transcribeAsset: (assetId: Id) => Promise<void>;
   addSubtitlesClip: (clipId: Id) => Promise<void>;
   generateVertical: () => Promise<void>;
@@ -70,6 +71,11 @@ export interface UiState {
   cutTimelineRanges: (ranges: [TimeUs, TimeUs][]) => Promise<void>;
   moveTimelineRange: (fromUs: TimeUs, toUs: TimeUs, destUs: TimeUs) => Promise<void>;
   setClipText: (clipId: Id, content: string, style: TextStyle) => Promise<void>;
+  setSubtitlesProps: (
+    clipId: Id,
+    style: TextStyle,
+    mode: "phrase" | "word" | "karaoke",
+  ) => Promise<void>;
   toggleTrack: (trackId: Id, prop: "muted" | "solo" | "locked") => Promise<void>;
   undo: () => Promise<void>;
   redo: () => Promise<void>;
@@ -333,15 +339,17 @@ export const useStore = create<UiState>((set, get) => {
       }
     },
 
-    removeSilences: async (clipId) => {
+    removeSilences: async (clipId, mode) => {
       try {
         set({ lastActionLabel: "Analizando silencios…" });
-        const r = await engine.removeSilences(clipId);
+        const r = await engine.removeSilences(clipId, mode);
         const secs = (r.removed_us / 1e6).toFixed(1);
         applySnapshot(
           r.snapshot,
           r.removed > 0
-            ? `Eliminados ${r.removed} silencios (${secs} s)`
+            ? mode === "speedup"
+              ? `Acelerados ${r.removed} silencios 4× (${secs} s)`
+              : `Eliminados ${r.removed} silencios (${secs} s)`
             : "No se encontraron silencios",
         );
       } catch (e) {
@@ -349,11 +357,16 @@ export const useStore = create<UiState>((set, get) => {
       }
     },
 
+    setClipSpeed: (clipId, speed) =>
+      run(`Velocidad ${speed}×`, () => engine.setClipSpeed(clipId, speed)),
+
     addTextClip: async () => {
       await run("Añadir título", () => engine.addTextClip("Título", get().playheadUs));
     },
     setClipText: (clipId, content, style) =>
       run("Editar texto", () => engine.setClipText(clipId, content, style)),
+    setSubtitlesProps: (clipId, style, mode) =>
+      run("Editar subtítulos", () => engine.setSubtitlesProps(clipId, style, mode)),
 
     reloadEffectPacks: async () => {
       try {

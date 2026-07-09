@@ -14,6 +14,8 @@ pub enum Segment {
         asset_id: Id,
         src_in: TimeUs,
         src_out: TimeUs,
+        /// Velocidad del clip (rate stretch): salida = fuente / speed.
+        speed: f64,
         /// Cadena de efectos+transform del clip (ue-render), ya renderizada.
         vf: Option<String>,
         /// Crossfade con el tramo anterior: duración (µs). Los handles ya
@@ -24,9 +26,12 @@ pub enum Segment {
 }
 
 impl Segment {
+    /// Duración de SALIDA del tramo (la fuente dividida por la velocidad).
     pub fn duration(&self) -> TimeUs {
         match self {
-            Segment::Source { src_in, src_out, .. } => src_out - src_in,
+            Segment::Source { src_in, src_out, speed, .. } => {
+                (((src_out - src_in) as f64) / speed).round() as TimeUs
+            }
             Segment::Black { duration } => *duration,
         }
     }
@@ -54,9 +59,6 @@ pub fn build_video_edl_with(
     for track in seq.tracks.iter().filter(|t| t.kind == TrackKind::Video && !t.muted) {
         for clip in &track.clips {
             if let ClipPayload::Media { .. } = clip.payload {
-                if (clip.speed - 1.0).abs() > 1e-9 {
-                    return Err(ExportError::SpeedUnsupported(clip.speed));
-                }
                 cuts.insert(clip.start);
                 cuts.insert(clip.end());
             }
@@ -77,13 +79,17 @@ pub fn build_video_edl_with(
         for track in seq.tracks.iter().rev().filter(|t| t.kind == TrackKind::Video && !t.muted) {
             for clip in &track.clips {
                 if clip.start <= mid && mid < clip.end() {
-                    if let ClipPayload::Media { asset_id, src_in, .. } = &clip.payload {
+                    if let ClipPayload::Media { asset_id, src_in, src_out } = &clip.payload {
                         if project.asset(*asset_id).is_none() {
                             return Err(ExportError::MissingAsset(*asset_id));
                         }
-                        let s_in = *src_in + (a - clip.start);
+                        let s_in =
+                            *src_in + ((a - clip.start) as f64 * clip.speed).round() as TimeUs;
+                        let s_out =
+                            *src_in + ((b - clip.start) as f64 * clip.speed).round() as TimeUs;
                         // la transición pertenece al PRIMER tramo del clip
-                        let transition_in = if a == clip.start {
+                        // (v0: sin transiciones sobre clips acelerados)
+                        let transition_in = if a == clip.start && (clip.speed - 1.0).abs() < 1e-9 {
                             clip.transition_in.as_ref().map(|t| t.duration)
                         } else {
                             None
@@ -91,8 +97,9 @@ pub fn build_video_edl_with(
                         found = Some(Segment::Source {
                             asset_id: *asset_id,
                             src_in: s_in,
-                            src_out: s_in + (b - a),
-                            vf: ue_render::clip_vf(&registry, &clip.effects, &clip.transform),
+                            src_out: s_out.min(*src_out),
+                            speed: clip.speed,
+                            vf: ue_render::clip_vf(&registry, &clip.effects, &clip.transform, Some(seq.resolution)),
                             transition_in,
                         });
                     }
@@ -120,15 +127,18 @@ pub fn build_video_edl_with(
     for seg in segments {
         match (merged.last_mut(), &seg) {
             (
-                Some(Segment::Source { asset_id: a1, src_out: o1, vf: v1, .. }),
+                Some(Segment::Source { asset_id: a1, src_out: o1, vf: v1, speed: s1, .. }),
                 Segment::Source {
                     asset_id: a2,
                     src_in: i2,
                     src_out: o2,
                     vf: v2,
+                    speed: s2,
                     transition_in: None,
                 },
-            ) if a1 == a2 && o1 == i2 && v1 == v2 => *o1 = *o2,
+            ) if a1 == a2 && o1 == i2 && v1 == v2 && (s1.to_bits() == s2.to_bits()) => {
+                *o1 = *o2
+            }
             (Some(Segment::Black { duration: d1 }), Segment::Black { duration: d2 }) => {
                 *d1 += *d2;
             }
@@ -173,6 +183,7 @@ fn apply_transition_handles(project: &Project, segments: &mut [Segment]) {
             continue;
         }
         let (avail_left, prev_is_source) = match &segments[i - 1] {
+            Segment::Source { speed, .. } if (*speed - 1.0).abs() > 1e-9 => (0, false),
             Segment::Source { asset_id, src_out, .. } => {
                 let dur = project.asset(*asset_id).map(|a| a.probe.duration_us).unwrap_or(0);
                 ((dur - src_out).max(0), true)

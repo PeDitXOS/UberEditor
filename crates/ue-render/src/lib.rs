@@ -188,11 +188,14 @@ pub fn catalog_json(registry: &[EffectDef]) -> serde_json::Value {
 // Transform2D → cadena ffmpeg (backend v0)
 // ---------------------------------------------------------------------------
 
-/// Cadena -vf del transform de un clip: crop → escala → rotación → flips
-/// (orden del PLAN §6.8). Posición y opacidad requieren composición real
-/// (motor wgpu); v0 las omite. Curvas: se evalúan en t=0 (keyframes de
-/// transform en render llegan con el motor wgpu).
-pub fn transform_vf(t: &ue_core::model::Transform2D) -> Option<String> {
+/// Cadena -vf del transform de un clip: crop → escala → rotación → flips →
+/// posición (orden del PLAN §6.8). La posición compone sobre un lienzo del
+/// tamaño de la secuencia (color+overlay, requiere `canvas`). Opacidad llega
+/// con wgpu. Curvas: se evalúan en t=0.
+pub fn transform_vf(
+    t: &ue_core::model::Transform2D,
+    canvas: Option<(u32, u32)>,
+) -> Option<String> {
     let mut parts: Vec<String> = vec![];
 
     let (l, top, r, b) = (
@@ -233,6 +236,16 @@ pub fn transform_vf(t: &ue_core::model::Transform2D) -> Option<String> {
         parts.push("vflip".into());
     }
 
+    // posición: componer sobre un lienzo del tamaño de la secuencia
+    let (px, py) = (t.position.0.eval(0).round() as i64, t.position.1.eval(0).round() as i64);
+    if let Some((cw, ch)) = canvas.filter(|_| px != 0 || py != 0) {
+        static POS_UNIQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = POS_UNIQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        parts.push(format!(
+            "null[p{n}fg];color=c=black:s={cw}x{ch}[p{n}bg];[p{n}bg][p{n}fg]overlay=x=(W-w)/2+{px}:y=(H-h)/2+{py}:shortest=1"
+        ));
+    }
+
     if parts.is_empty() {
         None
     } else {
@@ -245,8 +258,9 @@ pub fn clip_vf(
     registry: &[EffectDef],
     effects: &[EffectInstance],
     transform: &ue_core::model::Transform2D,
+    canvas: Option<(u32, u32)>,
 ) -> Option<String> {
-    match (render_chain(registry, effects), transform_vf(transform)) {
+    match (render_chain(registry, effects), transform_vf(transform, canvas)) {
         (Some(e), Some(t)) => Some(format!("{e},{t}")),
         (Some(e), None) => Some(e),
         (None, Some(t)) => Some(t),
@@ -347,14 +361,14 @@ mod tests {
     #[test]
     fn transform_noop_is_none_and_order_is_crop_scale_rotate_flip() {
         use ue_core::model::Transform2D;
-        assert_eq!(transform_vf(&Transform2D::default()), None);
+        assert_eq!(transform_vf(&Transform2D::default(), None), None);
 
         let mut t = Transform2D::default();
         t.crop.0 = 0.25.into(); // 25% por la izquierda
         t.scale = (0.5.into(), 0.5.into());
         t.rotation = 180.0.into();
         t.flip_h = true;
-        let vf = transform_vf(&t).unwrap();
+        let vf = transform_vf(&t, None).unwrap();
         let crop_pos = vf.find("crop=").unwrap();
         let scale_pos = vf.find("scale=").unwrap();
         let rot_pos = vf.find("rotate=").unwrap();
@@ -371,7 +385,7 @@ mod tests {
         let fx = [inst("core.gaussian_blur", &[("sigma", 3.0)], &[])];
         let mut t = Transform2D::default();
         t.flip_v = true;
-        let vf = clip_vf(&reg, &fx, &t).unwrap();
+        let vf = clip_vf(&reg, &fx, &t, None).unwrap();
         assert!(vf.starts_with("gblur"), "{vf}");
         assert!(vf.ends_with("vflip"), "{vf}");
     }

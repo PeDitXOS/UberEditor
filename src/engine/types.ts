@@ -298,23 +298,31 @@ export function assetTimeToTimeline(
   return null;
 }
 
-/** Texto del subtítulo activo de un clip Subtitles en el tiempo dado. */
+/** Texto del subtítulo activo de un clip Subtitles en el tiempo dado
+ *  (respeta el modo: frase completa o palabra suelta más grande). */
 export function activeSubtitleText(
   project: Project,
   clip: Clip,
   playheadUs: TimeUs,
 ): { content: string; style: TextStyle } | null {
   if (clip.payload.type !== "subtitles") return null;
-  const doc = project.transcripts.find((t) => t.id === (clip.payload as { transcript_id: Id }).transcript_id);
+  const { transcript_id, style, mode } = clip.payload;
+  const doc = project.transcripts.find((t) => t.id === transcript_id);
   if (!doc) return null;
-  for (const seg of doc.segments) {
-    const tlStart = assetTimeToTimeline(project, doc.asset_id, seg.start_us);
+  const items =
+    mode === "phrase"
+      ? doc.segments.map((s) => ({ text: s.text, s: s.start_us, e: s.end_us }))
+      : doc.words
+          .filter((w) => !w.rejected)
+          .map((w) => ({ text: w.text, s: w.start_us, e: w.end_us }));
+  const effStyle = mode === "phrase" ? style : { ...style, size: style.size * 1.6 };
+  for (const item of items) {
+    const tlStart = assetTimeToTimeline(project, doc.asset_id, item.s);
     if (tlStart === null) continue;
-    const tlEnd = tlStart + (seg.end_us - seg.start_us);
+    const tlEnd = tlStart + (item.e - item.s);
     const from = Math.max(tlStart, clip.start);
     const to = Math.min(tlEnd, clip.start + clip.duration);
-    if (playheadUs >= from && playheadUs < to)
-      return { content: seg.text, style: clip.payload.style };
+    if (playheadUs >= from && playheadUs < to) return { content: item.text, style: effStyle };
   }
   return null;
 }
