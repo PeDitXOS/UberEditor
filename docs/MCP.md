@@ -39,7 +39,7 @@ curl -s http://127.0.0.1:4599/mcp \
 
 ---
 
-## The five rules
+## The rules
 
 1. **Time is always integer microseconds (µs) on the timeline.** Never seconds,
    never frames. `1 s = 1_000_000`. A float is rejected at the boundary.
@@ -52,20 +52,25 @@ curl -s http://127.0.0.1:4599/mcp \
 4. **Errors are tool errors, not protocol errors** — `isError: true` and a
    message meant to be acted on ("the audio is still being prepared…").
 5. **Ids are ULID strings.** Get them from `get_timeline`, `get_media_pool` or
-   `get_project_summary`. Never invent one.
+   `get_project_summary`. Never invent one. Clips also carry a friendly
+   `label` in `get_timeline`, and you can set one with `set_clip_name`.
+6. **Slow tools are async.** `transcribe_asset`, `export_video` and
+   `generate_avatar_video` hand back a `job_id`; poll `get_job_status`. A
+   client timeout on the launch is not a failure — the job runs on.
 
 ---
 
 ## Typical session
 
 ```jsonc
-get_project_summary {}                       // what is open? which sequence is active?
-import_media { "paths": ["/abs/take1.mp4"] } // → asset_id
-transcribe_asset { "asset_id": "…" }         // blocks; → transcript_id  (needed by 4 other tools)
-add_clip { "asset_id": "…" }                 // → clip_id
+get_project_summary {}                            // what is open? which sequence is active?
+import_media { "paths": ["/abs/take1.mp4"] }      // → asset_id
+transcribe_asset { "asset_id": "…" }              // → job_id; poll get_job_status → {transcript_id}
+add_clip { "asset_id": "…" }                      // → clip_id
 remove_silences { "clip_id": "…", "mode": "delete" }
 add_subtitles_clip { "clip_id": "…" }
-export_video { "path": "/abs/out.mp4" }
+debug_render_frame { "t_us": 1000000 }            // SEE the frame (subtitles included) before exporting
+export_video { "path": "/abs/out.mp4" }           // → job_id; poll get_job_status → {path}
 save_project { "path": "/abs/project.uep" }
 ```
 
@@ -75,16 +80,20 @@ save_project { "path": "/abs/project.uep" }
 _"the audio is still being prepared (conform); try again in a few seconds"_.
 Poll `get_media_pool` and wait for `audio_conform` to be non-null.
 
-**Slow tools.** `transcribe_asset`, `generate_avatar_video` and `export_video`
-block until they finish — minutes, and the first transcription also downloads
-the Whisper model. The server is single-threaded, so nothing else runs
-meanwhile.
+**Slow tools are async — a timeout is NOT a failure.** `transcribe_asset`,
+`generate_avatar_video` and `export_video` return a `job_id` immediately and
+run in the background (minutes; the first transcription also downloads the
+Whisper model). Poll `get_job_status {job_id}` until `status` is `done` (the
+real result is in `result`) or `error`. **Never re-run one because the launch
+"timed out"** — the job is still going; re-transcribing replaces the
+transcript, re-exporting wastes minutes. While a job runs on its thread, the
+server still answers other calls (polls, reads).
 
 ---
 
 ## Tools
 
-47 tools. `tools/list` carries the full schema for each, plus MCP annotations:
+51 tools. `tools/list` carries the full schema for each, plus MCP annotations:
 
 | annotation | meaning |
 |---|---|
@@ -97,18 +106,37 @@ meanwhile.
 | Tool | What you get |
 |---|---|
 | `get_project_summary` | name, save path, every sequence (id, resolution, fps, duration, tracks), asset/transcript counts, avatar setups, undo history |
-| `get_timeline` | the full sequence: tracks → clips with payload, transform, audio, effects, transition |
+| `get_timeline` | the full sequence: tracks → clips, each with a human-friendly `label`, payload, transform, audio, effects, transition |
 | `get_media_pool` | assets: id, path, kind, duration, probe, and whether `audio_conform`/`proxy`/`transcript` are ready |
-| `get_transcript` | words with µs timestamps, `display` overrides, segments with emotion and volume |
+| `get_transcript` | the transcript at a chosen `granularity`, optionally windowed (see below) |
+| `find_words` | locate a word/phrase → each hit's timestamp + neighbour context |
 | `get_catalog` | effect ids + their params, generator ids, installed font families, saved text templates, avatar setups, subtitle modes, transition ids |
+
+**`get_transcript` granularity.** The full word dump is 100k+ characters, so
+this tool is tiered. Default `phrases` (caption-sized chunks with timestamps)
+is the right unit for choosing cuts. `start_us`/`end_us` window any level.
+
+| `granularity` | returns |
+|---|---|
+| `text` | just the words joined, no timing (cheap, for reading) |
+| `segments` | Whisper's own coarse chunks (carry emotion/volume) |
+| `phrases` (default) / `sentences` | caption-sized chunks `{text, start_us, end_us}` |
+| `words` | every word `{index, text, start_us, end_us}` — window it |
+
+**`find_words`** `{query, asset_id|transcript_id, context?}` → `{hits: [{index,
+start_us, end_us, context}]}`. Case- and punctuation-insensitive; multi-word
+phrases work. This is how you find a cut point: `find_words "in conclusion"` →
+its `start_us`, then `cut_ranges`/`move_range` around it.
 
 ### Media
 
 - **`import_media`** `{paths[]}` → asset ids. Idempotent by content hash. Does
   not place anything on the timeline.
-- **`transcribe_asset`** `{asset_id, model?}` → `{transcript_id, words}`.
-  Word-level Whisper. Blocking. Required by `add_subtitles_clip`,
-  `replace_words`, `set_word_text` and `generate_avatar_video`.
+- **`transcribe_asset`** `{asset_id, model?}` → **`job_id`** (async; poll
+  `get_job_status` → `{transcript_id, words}`). Word-level Whisper. Required by
+  `add_subtitles_clip`, `replace_words`, `set_word_text` and
+  `generate_avatar_video`. Re-transcribing **keeps the transcript id**, so
+  existing subtitles clips keep working — you don't need to recreate them.
 - **`set_project_settings`** `{whisper_language?, whisper_model?}` — the
   defaults `transcribe_asset` uses. Set the language (`es`, `en`, `auto`)
   *before* transcribing.
@@ -154,11 +182,33 @@ Keys are sorted and de-duplicated on write.
 
 Transform patch keys: `position_x/y`, `scale_x/y`, `rotation` (degrees),
 `opacity` (0..1), `crop_left/top/right/bottom` (0..1), `flip_h`, `flip_v`.
+`position` is in **pixels from the canvas centre**; `y_offset` (in `style`) is
+in **pixels from the bottom** — positive moves the caption up.
 
 **`set_clip_content`** edits what a clip *shows*, depending on its payload: the
-words and style of a Text clip, the style and `subtitles_mode`
-(`phrase|word|karaoke`) of a Subtitles clip, or the parameters of a Generator
-clip. `style` is a patch too.
+words and style of a Text clip, the style and `subtitles_mode` of a Subtitles
+clip, or the parameters of a Generator clip. `style` is a patch too, and it
+**warns** (doesn't fail) if the `font` isn't installed — a font that doesn't
+resolve draws nothing. The default `sans-serif` (and `serif`/`monospace`) map
+to a real installed font, so they always render.
+
+**`set_clip_name`** `{clip_id, name}` gives a clip a readable name (empty
+clears it). `get_timeline` shows a `label` for every clip — the custom name, or
+one derived from the payload (media filename, title text, generator id) — so
+you never work from raw ULIDs.
+
+Subtitle modes (what each actually produces):
+
+| `subtitles_mode` | on screen |
+|---|---|
+| `phrase` (default) | caption-sized chunks built from the **word** timestamps — short, ~a line; NOT Whisper's minute-long segments. Great for shorts. |
+| `word` | one large word at a time (TikTok style) |
+| `karaoke` | the phrase line with the current word highlighted as it's spoken (per-word fill is export-only; the preview shows the phrase) |
+
+`phrase` chunk size follows the font size and canvas width. For fewer/longer
+lines, raise the subtitle `size` less or widen the canvas; the same chunker is
+exposed as `get_transcript { granularity: "phrases", max_chars }` if you want
+to preview the split.
 
 ### Tracks and sequences
 
@@ -179,9 +229,21 @@ clip. `style` is a patch too.
   `import_avatar_config` (ours or a Youtubers-toolkit `config.json`; same name
   replaces instead of duplicating) and `export_avatar_config` (**never** writes
   the `api_key` out).
-- **`generate_avatar_video`** `{config_id, driver_asset}` → a transparent avatar
-  video, imported as an asset. **The driver is the voice**: only the asset's
-  transcript and audio matter, never its video. Blocking, minutes.
+- **`generate_avatar_video`** `{config_id, driver_asset}` → **`job_id`** (async;
+  poll `get_job_status` → `{asset_id}`). A transparent avatar video, imported as
+  an asset. **The driver is the voice**: only the asset's transcript and audio
+  matter, never its video.
+
+### Jobs (async long operations)
+
+`transcribe_asset`, `export_video` and `generate_avatar_video` return a
+`job_id` right away and run in the background.
+
+- **`get_job_status`** `{job_id}` → `{status: running|done|error, progress,
+  message, result?, error?}`. Poll until `done` (result is in `result`) or
+  `error`. A launch that "times out" client-side is **still running** — poll,
+  don't re-run.
+- **`list_jobs`** — every job this session, newest first.
 
 ### Project, render, history
 
@@ -190,26 +252,33 @@ clip. `style` is a patch too.
 - `reload_effect_packs` — re-read the user effect packs after writing a
   manifest to disk, so an agent can extend the editor and use the new effect
   in the same session.
-- **`export_video`** `{path, ranges?, format?, max_height?, crf?, loudnorm?}` —
-  blocking. `ranges: [[start_us, end_us], …]` renders several chunks of the
-  timeline concatenated **into one file**, in the order given (the "pieces"
-  feature). Omit it to render everything.
+- **`export_video`** `{path, ranges?, format?, max_height?, crf?, loudnorm?}` →
+  **`job_id`** (async; poll `get_job_status` → `{path, pieces}`). `ranges:
+  [[start_us, end_us], …]` renders several chunks of the timeline concatenated
+  **into one file**, in the order given (the "pieces" feature). Omit it to
+  render everything. The timeline is snapshotted at call time.
 - `undo`, `redo`.
 
 ### Debugging what the user sees
 
 The paused preview, the playback stream and the export are **three different
-code paths**. When something looks wrong, check the one that is actually broken:
+code paths**. `debug_render_frame` and `debug_playback_frame` **return the JPEG
+as an image** you can see (plus the temp path), and error with a clear message
+instead of handing back a black frame.
 
 | Tool | Path |
 |---|---|
-| `debug_render_frame {t_us}` | the **paused** preview → temp JPEG, `{path, bytes}` |
+| `debug_render_frame {t_us}` | the **paused** preview — includes titles + subtitles active at `t_us`, composited like the export |
 | `debug_playback_frame {}` | whatever is in the **playback** stream buffer right now |
-| `playback {action: play\|pause\|position}` | drives the real player |
+| `playback {action: play\|pause\|seek\|position}` | drives the real player |
 | `export_video` | the export |
 
-`bytes: 0` (or a suspiciously tiny JPEG) means the frame came out black. Read
-the file to *see* what the editor sees.
+**The paused preview shows titles and subtitles**, positioned exactly as the
+export burns them in — so `debug_render_frame` is now a faithful way to check
+text placement (e.g. the caption band for a vertical short) without a full
+render. Two caveats: the *video* itself is still the top layer only (extra
+video tracks are composited only in the export), and karaoke shows the phrase
+line without the per-word highlight in preview.
 
 ---
 
@@ -222,7 +291,7 @@ The coverage test allows exactly these gaps, so the list stays honest:
 | `get_state`, `ui_log`, `mcp_status` | GUI plumbing; `get_project_summary` + `get_timeline` cover the state |
 | `get_audio_peaks`, `ensure_thumbs`, `get_thumb_strip`, `playback_frame` | visual caches and binary streams for the timeline widget |
 | `pick_avatar_media` | opens a native file dialog; an agent passes paths directly |
-| `cancel_export` | `export_video` blocks the single-threaded server, so nothing could call it |
+| `cancel_export` | the agent controls export timing through the job (it just doesn't launch one it doesn't want) |
 | `add_avatar_clip` | legacy toolkit path, superseded by `save_avatar_config` → `generate_avatar_video` → `add_clip` |
 | `check_recovery`, `recover_project`, `discard_recovery` | the UI's crash-recovery prompt; they need the app's data dir |
 | `set_clip_transform/audio/effects/speed/transition`, `set_clip_text`, `set_subtitles_props`, `set_clip_generator` | folded into `set_clip_properties` / `set_clip_content` (one call, one undo) |

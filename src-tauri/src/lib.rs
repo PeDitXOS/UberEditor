@@ -2146,8 +2146,14 @@ fn transcribe_plan(
 }
 
 /// Stores a finished transcript on the asset (replacing any previous one).
-fn transcribe_commit(state: &AppState, asset_id: Id, doc: ue_core::model::TranscriptDoc) -> Id {
+fn transcribe_commit(state: &AppState, asset_id: Id, mut doc: ue_core::model::TranscriptDoc) -> Id {
     let mut store = state.store.lock().unwrap();
+    // Re-transcribing must KEEP the transcript id: existing subtitles clips
+    // reference it, and minting a new id would leave them dangling (they'd
+    // render nothing). Reuse the old id, then replace the doc in place.
+    if let Some(old) = store.project.transcripts.iter().find(|t| t.asset_id == asset_id) {
+        doc.id = old.id;
+    }
     let doc_id = doc.id;
     store.project.transcripts.retain(|t| t.asset_id != asset_id);
     store.project.transcripts.push(doc);
@@ -3025,4 +3031,50 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to start UberEditor");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ue_core::model::{Segment, TranscriptDoc, Word};
+
+    fn doc(asset_id: Id, word: &str) -> TranscriptDoc {
+        TranscriptDoc {
+            id: Id::new(),
+            asset_id,
+            language: "es".into(),
+            model: "t".into(),
+            words: vec![Word {
+                text: word.into(),
+                start_us: 0,
+                end_us: 1_000_000,
+                confidence: 1.0,
+                rejected: false,
+                display: None,
+            }],
+            segments: vec![Segment {
+                text: word.into(),
+                start_us: 0,
+                end_us: 1_000_000,
+                word_range: (0, 1),
+                emotion: None,
+                volume_rms: 0.0,
+            }],
+            global_avg_volume: 0.0,
+        }
+    }
+
+    /// Re-transcribing keeps the transcript id, so subtitles clips that
+    /// reference it don't dangle (field bug: had to delete+recreate the clip).
+    #[test]
+    fn retranscribe_preserves_the_transcript_id() {
+        let state = AppState::new_default();
+        let asset_id = Id::new();
+        let first = transcribe_commit(&state, asset_id, doc(asset_id, "uno"));
+        let second = transcribe_commit(&state, asset_id, doc(asset_id, "dos"));
+        assert_eq!(first, second, "the id is stable across re-transcription");
+        let store = state.store.lock().unwrap();
+        assert_eq!(store.project.transcripts.len(), 1, "the old doc was replaced, not stacked");
+        assert_eq!(store.project.transcripts[0].words[0].text, "dos", "content updated");
+    }
 }
