@@ -594,6 +594,7 @@ impl Default for TextStyle {
             x_offset: 0.0,
             y_offset: 0.0,
             align: TextAlign::Center,
+            direction: TextDirection::LTR,
             line_height: default_line_height(),
         }
     }
