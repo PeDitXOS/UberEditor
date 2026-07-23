@@ -599,6 +599,12 @@ export class MockEngine implements EngineClient {
   async mcpStatus(): Promise<[number, string] | null> {
     return null;
   }
+  async mcpCall(): Promise<unknown> {
+    throw new Error("MCP requires the desktop app");
+  }
+  async mcpListTools(): Promise<unknown> {
+    throw new Error("MCP requires the desktop app");
+  }
   async setProjectSettings(lang: string, model: string): Promise<StateSnapshot> {
     return this.transaction("AI settings", () => {
       this.project.settings.whisper_language = lang;

@@ -2471,6 +2471,99 @@ fn mcp_status(state: State<AppState>) -> Option<(u16, String)> {
     Some((port, state.mcp_token.lock().unwrap().clone()))
 }
 
+/// Invoke an MCP tool by name with JSON arguments.
+/// Returns the tool result as a JSON value.
+#[tauri::command]
+async fn mcp_call(
+    state: State<'_, AppState>,
+    tool_name: String,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (port, token) = {
+        let port = state.mcp_port.lock().map_err(|e| e.to_string())?;
+        let token = state.mcp_token.lock().map_err(|e| e.to_string())?;
+        match (*port, token.clone()) {
+            (Some(p), t) => (p, t),
+            _ => return Err("MCP server not running".into()),
+        }
+    };
+
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let client = reqwest::Client::new();
+
+    // JSON-RPC 2.0 request
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        }
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("MCP request failed: {e}"))?;
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("MCP response parse error: {e}"))?;
+
+    // Extract result from JSON-RPC response
+    if let Some(error) = body.get("error") {
+        return Err(error.get("message").and_then(|m| m.as_str()).unwrap_or("MCP error").to_string());
+    }
+    Ok(body.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// List available MCP tools.
+#[tauri::command]
+async fn mcp_list_tools(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let (port, token) = {
+        let port = state.mcp_port.lock().map_err(|e| e.to_string())?;
+        let token = state.mcp_token.lock().map_err(|e| e.to_string())?;
+        match (*port, token.clone()) {
+            (Some(p), t) => (p, t),
+            _ => return Err("MCP server not running".into()),
+        }
+    };
+
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let client = reqwest::Client::new();
+
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("MCP request failed: {e}"))?;
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("MCP response parse error: {e}"))?;
+
+    Ok(body.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
 #[tauri::command]
 fn cancel_export(state: State<AppState>) -> Res<()> {
     state.export_cancel.store(true, Ordering::SeqCst);
@@ -2874,6 +2967,8 @@ pub fn run() {
             get_effects_catalog,
             reload_effect_packs,
             mcp_status,
+            mcp_call,
+            mcp_list_tools,
             set_clip_effects,
             set_clip_transition,
             set_track_prop,

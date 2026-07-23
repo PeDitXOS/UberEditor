@@ -424,6 +424,12 @@ export class TauriEngine implements EngineClient {
   mcpStatus(): Promise<[number, string] | null> {
     return invoke("mcp_status");
   }
+  mcpCall(toolName: string, args: Record<string, unknown>): Promise<unknown> {
+    return invoke("mcp_call", { toolName, arguments: args });
+  }
+  mcpListTools(): Promise<unknown> {
+    return invoke("mcp_list_tools");
+  }
   setProjectSettings(whisperLanguage: string, whisperModel: string): Promise<StateSnapshot> {
     return invoke("set_project_settings", { whisperLanguage, whisperModel });
   }

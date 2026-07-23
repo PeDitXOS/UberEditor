@@ -258,6 +258,10 @@ export interface EngineClient {
 
   /** (port, token) of the embedded MCP server (null if not active). */
   mcpStatus(): Promise<[number, string] | null>;
+  /** Invoke an MCP tool by name with arguments. */
+  mcpCall(toolName: string, args: Record<string, unknown>): Promise<unknown>;
+  /** List available MCP tools. */
+  mcpListTools(): Promise<unknown>;
   setProjectSettings(whisperLanguage: string, whisperModel: string): Promise<StateSnapshot>;
 
   // -- export progress --
