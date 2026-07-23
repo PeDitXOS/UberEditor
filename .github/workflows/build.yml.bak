@@ -1,0 +1,36 @@
+name: Build
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Debug Startup
+        run: |
+          echo "Runner is alive"
+          node -v
+
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      
+      - uses: FedericoCarboni/setup-ffmpeg@v3
+      
+      - run: npm ci
+      - run: npm run build
+      
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v${{ github.run_number }}
+          releaseName: 'UberEditor Windows Build ${{ github.run_number }}'
+          releaseBody: 'Automated Windows build'
+          releaseDraft: true
+          prerelease: false
+          args: '--bundles nsis,msi'
